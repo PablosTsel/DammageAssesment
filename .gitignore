@@ -1,0 +1,16 @@
+# .gitignore
+
+
+# Hide your Python env
+myenv/
+
+
+# Hide xBD folder
+data/
+
+.cursorignore
+
+
+# You can also ignore other common files:
+__pycache__/
+*.pyc

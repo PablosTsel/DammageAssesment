@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# Integrated Building Damage Assessment Pipeline
+# This script combines building localization and damage classification
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import random
+from PIL import Image
+import matplotlib.pyplot as plt
+import torchvision.transforms as T
+from tqdm import tqdm
+import json
+from shapely import wkt
+import cv2
+from shapely.geometry import Polygon
+
+# Add parent directory to path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.dirname(script_dir))
+
+# Import your models
+# From the localization script
+from training.localization_model import UNet
+# From your classification script
+from training.train_baseline import BaselineModel, AttentionFusion
+
+class IntegratedBuildingAssessment:
+    """
+    Pipeline that combines building localization and damage classification.
+    First detects buildings using U-Net segmentation model, then classifies
+    damage level of each detected building.
+    """
+    def __init__(self, 
+                localization_model_path, 
+                classification_model_path, 
+                device=None):
+        """
+        Initialize the integrated building assessment pipeline.
+        
+        Args:
+            localization_model_path: Path to pretrained U-Net model weights
+            classification_model_path: Path to pretrained damage classification model weights
+            device: Device to run models on (cuda or cpu)
+        """
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
+        
+        # Initialize models
+        self.localization_model = self._load_localization_model(localization_model_path)
+        self.classification_model = self._load_classification_model(classification_model_path)
+        
+        # Define transforms for classification
+        self.pre_transform = T.Compose([
+            T.Resize((128, 128)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+        
+        self.post_transform = T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Damage label mapping
+        self.damage_labels = {
+            0: "no-damage",
+            1: "minor-damage",
+            2: "major-damage",
+            3: "destroyed"
+        }
+        
+    def _load_localization_model(self, model_path):
+        """
+        Load the U-Net model for building localization.
+        
+        Args:
+            model_path: Path to pretrained model weights
+            
+        Returns:
+            torch.nn.Module: Loaded model
+        """
+        try:
+            model = UNet(n_channels=3, n_classes=1, bilinear=True)
+            
+            # Check if model path exists
+            if not os.path.exists(model_path):
+                # Try alternative paths
+                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                alt_paths = [
+                    os.path.join(project_root, "best_unet_model.pt"),
+                    os.path.join(project_root, "final_unet_model.pt"),
+                    os.path.join(project_root, "output", "localization", "final_unet_model.pt")
+                ]
+                
+                for alt_path in alt_paths:
+                    if os.path.exists(alt_path):
+                        model_path = alt_path
+                        print(f"Using alternative localization model path: {model_path}")
+                        break
+                else:
+                    raise FileNotFoundError(f"Could not find localization model at {model_path} or any alternative paths")
+            
+            model.load_state_dict(torch.load(model_path, map_location=self.device))
+            model = model.to(self.device)
+            model.eval()
+            print(f"Successfully loaded localization model from {model_path}")
+            return model
+            
+        except Exception as e:
+            print(f"Error loading localization model: {e}")
+            raise
+    
+    def _load_classification_model(self, model_path):
+        """
+        Load the model for damage classification.
+        
+        Args:
+            model_path: Path to pretrained model weights
+            
+        Returns:
+            torch.nn.Module: Loaded model
+        """
+        try:
+            model = BaselineModel(num_classes=4)
+            
+            # Check if model path exists
+            if not os.path.exists(model_path):
+                # Try alternative paths
+                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                alt_paths = [
+                    os.path.join(project_root, "baseline_best.pt"),
+                    os.path.join(project_root, "output", "trainingTry1", "models", "baseline_best.pt"),
+                    os.path.join(project_root, "output", "trainingTry2", "models", "baseline_best.pt")
+                ]
+                
+                for alt_path in alt_paths:
+                    if os.path.exists(alt_path):
+                        model_path = alt_path
+                        print(f"Using alternative classification model path: {model_path}")
+                        break
+                else:
+                    raise FileNotFoundError(f"Could not find classification model at {model_path} or any alternative paths")
+            
+            model.load_state_dict(torch.load(model_path, map_location=self.device))
+            model = model.to(self.device)
+            model.eval()
+            print(f"Successfully loaded classification model from {model_path}")
+            return model
+            
+        except Exception as e:
+            print(f"Error loading classification model: {e}")
+            raise
+    
+    def _extract_building_patches(self, pre_image, post_image, mask, min_area=100):
+        """
+        Extract individual building patches from the segmentation mask.
+        
+        Args:
+            pre_image: Pre-disaster image (PIL Image)
+            post_image: Post-disaster image (PIL Image)
+            mask: Binary segmentation mask (numpy array)
+            min_area: Minimum contour area to consider as a building
+            
+        Returns:
+            list: List of dictionaries containing building information
+        """
+        # Convert mask to uint8 for contour detection
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        # Find contours
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        buildings = []
+        
+        for contour in contours:
+            # Filter small contours
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+            
+            # Get bounding box
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Ensure the box is not too small for cropping
+            if w < 10 or h < 10:
+                continue
+                
+            # Create building info
+            building = {
+                'contour': contour,
+                'bbox': (x, y, w, h),
+                'area': area,
+                'polygon': Polygon(contour.reshape(-1, 2))
+            }
+            
+            # Crop patches from pre and post images
+            pre_patch = pre_image.crop((x, y, x + w, y + h))
+            post_patch = post_image.crop((x, y, x + w, y + h))
+            
+            building['pre_patch'] = pre_patch
+            building['post_patch'] = post_patch
+            
+            buildings.append(building)
+            
+        return buildings
+    
+    def _classify_damage(self, pre_patch, post_patch):
+        """
+        Classify damage level for a building patch.
+        
+        Args:
+            pre_patch: Pre-disaster patch (PIL Image)
+            post_patch: Post-disaster patch (PIL Image)
+            
+        Returns:
+            tuple: (damage_class_index, damage_class_name, confidence)
+        """
+        # Prepare inputs
+        pre_tensor = self.pre_transform(pre_patch).unsqueeze(0).to(self.device)
+        post_tensor = self.post_transform(post_patch).unsqueeze(0).to(self.device)
+        
+        # Run inference
+        with torch.no_grad():
+            outputs = self.classification_model(pre_tensor, post_tensor)
+            probabilities = F.softmax(outputs, dim=1)
+            
+            # Get predicted class and confidence
+            confidence, predicted = torch.max(probabilities, 1)
+            damage_class = predicted.item()
+            confidence = confidence.item()
+            
+            return damage_class, self.damage_labels[damage_class], confidence
+    
+    def process_image_pair(self, pre_image_path, post_image_path, output_path=None):
+        """
+        Process a pair of pre- and post-disaster images.
+        
+        Args:
+            pre_image_path: Path to pre-disaster image
+            post_image_path: Path to post-disaster image
+            output_path: Path to save visualization (optional)
+            
+        Returns:
+            dict: Results including building detections and damage classifications
+        """
+        try:
+            # Check if image paths exist
+            if not os.path.exists(pre_image_path):
+                raise FileNotFoundError(f"Pre-disaster image not found at {pre_image_path}")
+            if not os.path.exists(post_image_path):
+                raise FileNotFoundError(f"Post-disaster image not found at {post_image_path}")
+            
+            # Load images
+            pre_image = Image.open(pre_image_path).convert("RGB")
+            post_image = Image.open(post_image_path).convert("RGB")
+            
+            # Resize images if they're too large (for memory efficiency)
+            max_size = 1024
+            if max(pre_image.size) > max_size:
+                pre_image = self._resize_with_aspect_ratio(pre_image, max_size)
+                post_image = self._resize_with_aspect_ratio(post_image, max_size)
+            
+            # Create copies for visualization
+            pre_vis = np.array(pre_image)
+            post_vis = np.array(post_image)
+            
+            # Prepare image for localization
+            localization_transform = T.Compose([
+                T.Resize((512, 512)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+            ])
+            
+            pre_tensor = localization_transform(pre_image).unsqueeze(0).to(self.device)
+            
+            # Run building localization
+            with torch.no_grad():
+                mask_logits = self.localization_model(pre_tensor)
+                mask_prob = torch.sigmoid(mask_logits)
+                mask = (mask_prob > 0.5).float()
+                
+            # Convert mask back to original size and numpy array
+            mask = mask.squeeze().cpu().numpy()
+            mask = cv2.resize(mask, (pre_image.size[0], pre_image.size[1]), 
+                            interpolation=cv2.INTER_NEAREST)
+            
+            # Extract building patches
+            buildings = self._extract_building_patches(pre_image, post_image, mask)
+            
+            print(f"Detected {len(buildings)} buildings")
+            
+            # Classify damage for each building
+            results = []
+            
+            for i, building in enumerate(tqdm(buildings, desc="Classifying buildings")):
+                pre_patch = building['pre_patch']
+                post_patch = building['post_patch']
+                
+                # Classify damage
+                damage_class, damage_label, confidence = self._classify_damage(pre_patch, post_patch)
+                
+                # Add to results
+                building['damage_class'] = damage_class
+                building['damage_label'] = damage_label
+                building['confidence'] = confidence
+                
+                results.append({
+                    'bbox': building['bbox'],
+                    'area': building['area'],
+                    'damage_class': damage_class,
+                    'damage_label': damage_label,
+                    'confidence': confidence
+                })
+                
+                # Add to visualization
+                x, y, w, h = building['bbox']
+                
+                # Color based on damage class
+                if damage_class == 0:  # no-damage
+                    color = (0, 255, 0)  # Green
+                elif damage_class == 1:  # minor-damage
+                    color = (255, 255, 0)  # Yellow
+                elif damage_class == 2:  # major-damage
+                    color = (255, 165, 0)  # Orange
+                else:  # destroyed
+                    color = (255, 0, 0)  # Red
+                    
+                # Draw on post-disaster image
+                cv2.rectangle(post_vis, (x, y), (x + w, y + h), color, 2)
+                
+                # Add label
+                label = f"{damage_label} ({confidence:.2f})"
+                cv2.putText(post_vis, label, (x, y - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Save or display visualization
+            if output_path:
+                # Create directories if they don't exist
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                
+                # Concatenate pre and post images
+                vis_image = np.hstack([pre_vis, post_vis])
+                cv2.imwrite(output_path, vis_image[:, :, ::-1])  # Convert BGR to RGB
+                print(f"Visualization saved to {output_path}")
+                
+                # Also save to project root
+                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                root_output_path = os.path.join(project_root, "damage_assessment_result.jpg")
+                cv2.imwrite(root_output_path, vis_image[:, :, ::-1])
+                print(f"Visualization also saved to project root: {root_output_path}")
+                
+            return {
+                'num_buildings': len(buildings),
+                'buildings': results,
+                'damage_counts': {
+                    'no-damage': sum(1 for b in results if b['damage_class'] == 0),
+                    'minor-damage': sum(1 for b in results if b['damage_class'] == 1),
+                    'major-damage': sum(1 for b in results if b['damage_class'] == 2),
+                    'destroyed': sum(1 for b in results if b['damage_class'] == 3)
+                }
+            }
+            
+        except Exception as e:
+            print(f"Error processing image pair: {e}")
+            # Return empty results on error
+            return {
+                'num_buildings': 0,
+                'buildings': [],
+                'damage_counts': {
+                    'no-damage': 0,
+                    'minor-damage': 0,
+                    'major-damage': 0,
+                    'destroyed': 0
+                },
+                'error': str(e)
+            }
+        
+    def _resize_with_aspect_ratio(self, image, max_size):
+        """
+        Resize image while maintaining aspect ratio.
+        
+        Args:
+            image: PIL Image
+            max_size: Maximum dimension
+            
+        Returns:
+            PIL.Image: Resized image
+        """
+        width, height = image.size
+        if width > height:
+            new_width = max_size
+            new_height = int(height * max_size / width)
+        else:
+            new_height = max_size
+            new_width = int(width * max_size / height)
+            
+        return image.resize((new_width, new_height), Image.BICUBIC)
+        
+    def export_results_geojson(self, results, output_path):
+        """
+        Export results to GeoJSON format.
+        
+        Args:
+            results: Results from process_image_pair
+            output_path: Path to save GeoJSON file
+        """
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            features = []
+            
+            for i, building in enumerate(results['buildings']):
+                feature = {
+                    "type": "Feature",
+                    "properties": {
+                        "id": i,
+                        "damage_class": building['damage_class'],
+                        "damage_label": building['damage_label'],
+                        "confidence": building['confidence'],
+                        "area": building['area']
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[building['bbox'][0], building['bbox'][1]],
+                                        [building['bbox'][0] + building['bbox'][2], building['bbox'][1]],
+                                        [building['bbox'][0] + building['bbox'][2], building['bbox'][1] + building['bbox'][3]],
+                                        [building['bbox'][0], building['bbox'][1] + building['bbox'][3]],
+                                        [building['bbox'][0], building['bbox'][1]]]]
+                    }
+                }
+                
+                features.append(feature)
+                
+            geojson = {
+                "type": "FeatureCollection",
+                "features": features
+            }
+            
+            with open(output_path, 'w') as f:
+                json.dump(geojson, f)
+                
+            print(f"Results exported to {output_path}")
+            
+            # Also save to project root
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            root_output_path = os.path.join(project_root, "damage_assessment_result.json")
+            with open(root_output_path, 'w') as f:
+                json.dump(geojson, f)
+            print(f"Results also exported to project root: {root_output_path}")
+            
+        except Exception as e:
+            print(f"Error exporting results to GeoJSON: {e}")
+
+
+def main():
+    """
+    Main function to demonstrate the integrated pipeline.
+    """
+    try:
+        # Get project root directory
+        project_root = os.path.abspath(os.path.dirname(__file__))
+        project_root = os.path.abspath(os.path.join(project_root, "..", ".."))
+        
+        # Paths to model weights with fallbacks
+        localization_model_paths = [
+            os.path.join(project_root, "output", "localization", "best_unet_model.pt"),
+            os.path.join(project_root, "best_unet_model.pt"),
+            os.path.join(project_root, "output", "localization", "final_unet_model.pt"),
+            os.path.join(project_root, "final_unet_model.pt")
+        ]
+        
+        classification_model_paths = [
+            os.path.join(project_root, "output", "models", "baseline_best.pt"),
+            os.path.join(project_root, "output", "trainingTry1", "models", "baseline_best.pt"),
+            os.path.join(project_root, "output", "trainingTry2", "models", "baseline_best.pt"),
+            os.path.join(project_root, "baseline_best.pt")
+        ]
+        
+        # Find existing model paths
+        localization_model_path = None
+        for path in localization_model_paths:
+            if os.path.exists(path):
+                localization_model_path = path
+                break
+        
+        if localization_model_path is None:
+            raise FileNotFoundError("Could not find localization model in any of the expected paths")
+            
+        classification_model_path = None
+        for path in classification_model_paths:
+            if os.path.exists(path):
+                classification_model_path = path
+                break
+                
+        if classification_model_path is None:
+            raise FileNotFoundError("Could not find classification model in any of the expected paths")
+            
+        print(f"Using localization model: {localization_model_path}")
+        print(f"Using classification model: {classification_model_path}")
+        
+        # Create output directory
+        output_dir = os.path.join(project_root, "output", "integrated_results")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create output directory {output_dir}: {e}")
+            output_dir = project_root
+            print(f"Using project root directory instead: {output_dir}")
+        
+        # Initialize pipeline
+        pipeline = IntegratedBuildingAssessment(
+            localization_model_path=localization_model_path,
+            classification_model_path=classification_model_path
+        )
+        
+        # Try multiple potential test image paths
+        test_image_paths = [
+            (os.path.join(project_root, "data", "test", "images", "hurricane-florence_00000000_pre_disaster.png"),
+             os.path.join(project_root, "data", "test", "images", "hurricane-florence_00000000_post_disaster.png")),
+            # Add more potential test pairs here if needed
+        ]
+        
+        test_pre_image_path = None
+        test_post_image_path = None
+        
+        for pre_path, post_path in test_image_paths:
+            if os.path.exists(pre_path) and os.path.exists(post_path):
+                test_pre_image_path = pre_path
+                test_post_image_path = post_path
+                break
+                
+        if test_pre_image_path is None or test_post_image_path is None:
+            raise FileNotFoundError("Could not find test images in any of the expected paths")
+            
+        print(f"Using test images: {test_pre_image_path} and {test_post_image_path}")
+        
+        output_vis_path = os.path.join(output_dir, "damage_assessment_result.jpg")
+        output_json_path = os.path.join(output_dir, "damage_assessment_result.json")
+        
+        # Process image pair
+        results = pipeline.process_image_pair(
+            pre_image_path=test_pre_image_path,
+            post_image_path=test_post_image_path,
+            output_path=output_vis_path
+        )
+        
+        # Export results to GeoJSON
+        pipeline.export_results_geojson(results, output_json_path)
+        
+        # Print damage statistics
+        print("Damage Assessment Statistics:")
+        print(f"Total buildings detected: {results['num_buildings']}")
+        print("Damage counts:")
+        for damage_type, count in results['damage_counts'].items():
+            percentage = count / results['num_buildings'] * 100 if results['num_buildings'] > 0 else 0
+            print(f"  {damage_type}: {count} ({percentage:.1f}%)")
+            
+    except Exception as e:
+        print(f"Error in main function: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()

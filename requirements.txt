@@ -1,0 +1,14 @@
+rasterio
+folium
+geopandas
+matplotlib
+cartopy
+tqdm
+torch 
+torchvision 
+torchaudio
+scikit-learn
+seaborn
+plotly
+contextily
+shapely

@@ -1,0 +1,60 @@
+Evaluation Results (Try 2)
+Date: 2025-03-07 10:25:30
+Model: /home/pablos/Documents/uc3m/Incase/output/trainingTry4/models/baseline_best.pt
+Test-Time Augmentation: True
+
+Confusion Matrix:
+[[40562   446   150   269]
+ [ 2427  1939   316   116]
+ [  826   165  2601   258]
+ [  469    58   232  3016]]
+
+Classification Report:
+              precision    recall  f1-score   support
+
+   no-damage     0.9160    0.9791    0.9465     41427
+minor-damage     0.7435    0.4041    0.5236      4798
+major-damage     0.7884    0.6756    0.7277      3850
+   destroyed     0.8243    0.7989    0.8114      3775
+
+    accuracy                         0.8936     53850
+   macro avg     0.8180    0.7144    0.7523     53850
+weighted avg     0.8850    0.8936    0.8837     53850
+
+
+Additional Metrics:
+Accuracy: 89.3556%
+Macro F1 Score: 0.7523
+Weighted F1 Score: 0.8837
+Macro Precision: 0.8180
+Weighted Precision: 0.8850
+Macro Recall: 0.7144
+Weighted Recall: 0.8936
+Cohen's Kappa: 0.6992
+Balanced Accuracy: 0.7144
+
+Error Analysis:
+  Most common misclassification patterns:
+  - no-damage → minor-damage (Error rate: 0.02)
+  - minor-damage → no-damage (Error rate: 0.60)
+  - major-damage → no-damage (Error rate: 0.32)
+  - destroyed → no-damage (Error rate: 0.20)
+
+Sample Predictions (randomly selected):
+Index    True Label      Predicted       Confidence Correct 
+------------------------------------------------------------
+41905    no-damage       no-damage       0.9629      ✓
+7296     no-damage       no-damage       1.0000      ✓
+1639     minor-damage    no-damage       0.7582      ✗
+48598    no-damage       no-damage       1.0000      ✓
+18024    no-damage       no-damage       1.0000      ✓
+16049    no-damage       no-damage       1.0000      ✓
+14628    no-damage       no-damage       0.7625      ✓
+9144     no-damage       no-damage       0.9990      ✓
+48265    no-damage       no-damage       1.0000      ✓
+6717     no-damage       no-damage       1.0000      ✓
+44348    no-damage       no-damage       0.9564      ✓
+48540    no-damage       no-damage       1.0000      ✓
+35741    major-damage    major-damage    0.9999      ✓
+5697     no-damage       no-damage       0.9999      ✓
+38698    no-damage       no-damage       0.9995      ✓

@@ -1,0 +1,1610 @@
+baseline_model:
+import torch                          # PyTorch deep learning library
+import torch.nn as nn                   # Neural network modules
+import torchvision.models as models     # Pre-trained models like ResNet
+
+class BaselineModel(nn.Module):
+    """
+    A single-branch model for damage classification from post-disaster images only.
+    
+    This model uses a pre-trained ResNet50 backbone followed by custom 
+    classification layers to predict building damage levels.
+    
+    The approach is simplified compared to the two-branch version since
+    we're now only processing post-disaster images.
+    """
+    def __init__(self, num_classes=4, dropout_rate=0.5):
+        """
+        Initialize the model.
+        
+        Parameters:
+        - num_classes: Number of damage classes to predict (default: 4)
+        - dropout_rate: Dropout probability for regularization (default: 0.5)
+        """
+        super().__init__()  # Initialize parent class
+
+        # Load a pre-trained ResNet50 model
+        # Try different parameter names depending on PyTorch version
+        try:
+            # For newer PyTorch versions
+            self.backbone = models.resnet50(weights='IMAGENET1K_V2')  # Pre-trained on ImageNet
+        except:
+            # For older PyTorch versions
+            self.backbone = models.resnet50(pretrained=True)  # Pre-trained on ImageNet
+        
+        # Get the number of features from the backbone
+        self.feature_dim = self.backbone.fc.in_features  # 2048 for ResNet50
+        
+        # Replace the original classification layer with Identity to get features only
+        self.backbone.fc = nn.Identity()
+
+        # Create a new classifier head for damage classification
+        self.classifier = nn.Sequential(
+            # First fully connected layer: 2048 -> 512
+            nn.Linear(self.feature_dim, 512),
+            nn.BatchNorm1d(512),           # Batch normalization for training stability
+            nn.ReLU(inplace=True),         # ReLU activation
+            nn.Dropout(dropout_rate),      # Dropout to prevent overfitting
+            
+            # Second fully connected layer: 512 -> 256
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            
+            # Output layer: 256 -> num_classes (4)
+            nn.Linear(256, num_classes)
+        )
+        
+        # Initialize the weights of the classifier layers
+        self._initialize_weights(self.classifier)
+        
+    def _initialize_weights(self, module):
+        """
+        Initialize the weights of the classifier layers using Kaiming initialization.
+        This helps with training deep networks by keeping the variance of activations
+        roughly the same across layers.
+        
+        Parameters:
+        - module: The module whose weights to initialize
+        """
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                # Initialize weights using Kaiming normal initialization
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)  # Initialize biases to zero
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)    # Initialize BatchNorm weights to 1
+                nn.init.constant_(m.bias, 0)      # Initialize BatchNorm biases to 0
+
+    def forward(self, x):
+        """
+        Forward pass through the model.
+        
+        Parameters:
+        - x: Input tensor of shape (batch_size, 3, H, W)
+        
+        Returns:
+        - Damage class predictions (batch_size, num_classes)
+        """
+        # Extract features from the backbone network
+        features = self.backbone(x)  # (batch, 2048)
+        
+        # Pass features through the classifier
+        outputs = self.classifier(features)  # (batch, num_classes)
+        
+        return outputs
+
+# Test the model if run directly
+if __name__ == "__main__":
+    # Create the model
+    model = BaselineModel(num_classes=4)
+    print(model)  # Print the model architecture
+
+    # Create dummy input for testing
+    dummy_input = torch.randn(2, 3, 224, 224)  # 2 images, 3 channels, 224x224 resolution
+
+    # Run the model on dummy input
+    outputs = model(dummy_input)
+    print("Output shape:", outputs.shape)  # Should be [2, 4]
+
+train_baseline:
+#!/usr/bin/env python3
+import os                                   # For handling file paths
+import sys                                  # For system operations
+import torch                                # PyTorch deep learning library
+import torch.nn as nn                       # Neural network modules
+import torch.optim as optim                 # Optimization algorithms
+from torch.utils.data import DataLoader, Subset  # For loading data in batches
+from tqdm import tqdm                       # Progress bar
+from collections import Counter             # For counting class frequencies
+import matplotlib.pyplot as plt             # For plotting
+import numpy as np                          # For numerical operations
+from sklearn.metrics import f1_score        # For computing F1 score
+import random                               # For random operations
+from datetime import datetime               # For timestamps
+import time                                 # For timing
+import torch.nn.functional as F             # Additional PyTorch functions
+from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
+
+# Add project root to Python's path so we can import our modules
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.append(project_root)
+
+# Import our custom model and dataset
+from overlaying_labels.models.baseline_model import BaselineModel
+from options.utils.data_loader import XBDPatchDataset, DAMAGE_LABELS
+
+def seed_everything(seed=42):
+    """
+    Set random seeds for reproducibility.
+    This ensures that the same 'random' operations produce the same results across runs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    # Enable benchmark mode for faster training when input sizes don't change
+    torch.backends.cudnn.benchmark = True
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to {seed}")
+
+def compute_sample_weights(dataset, indices, weight_scale=1.0):
+    """
+    Compute weights for each sample to handle class imbalance.
+    Rare classes get higher weights, common classes get lower weights.
+    
+    Parameters:
+    - dataset: The dataset containing samples
+    - indices: Indices of samples to compute weights for
+    - weight_scale: How strongly to weight rare classes (higher = stronger weighting)
+    
+    Returns:
+    - sample_weights: List of weights for each sample
+    - class_weights: Dictionary of weights for each class
+    """
+    # Extract the label for each sample
+    labels = [dataset.samples[i]["label"] for i in indices]
+    
+    # Count how many samples are in each class
+    counts = Counter(labels)
+    
+    # Calculate total number of samples
+    total = sum(counts.values())
+    
+    # Get number of classes
+    num_classes = len(DAMAGE_LABELS)
+    
+    # Compute weight for each class
+    # The formula gives higher weights to less frequent classes
+    class_weights = {cls: (total / (num_classes * counts[cls]))**weight_scale 
+                     for cls in counts}
+    
+    # Assign weight to each sample based on its class
+    sample_weights = [class_weights[label] for label in labels]
+    
+    return sample_weights, class_weights
+
+def mixup_data(x, y, alpha=0.2, device='cuda'):
+    """
+    Apply mixup data augmentation.
+    Mixup creates new training examples by linearly combining two existing examples.
+    
+    Parameters:
+    - x: Post-disaster image tensors
+    - y: Labels
+    - alpha: Parameter controlling the strength of mixup
+    - device: Device to use (cuda or cpu)
+    
+    Returns:
+    - Mixed images and labels
+    """
+    # Sample mixing weight from Beta distribution
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1  # No mixing
+
+    # Get batch size
+    batch_size = x.size()[0]
+    
+    # Generate random indices for mixing
+    index = torch.randperm(batch_size).to(device)
+
+    # Mix images
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    
+    # Get both sets of labels
+    y_a, y_b = y, y[index]
+    
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """
+    Apply the loss function to mixup outputs.
+    
+    Parameters:
+    - criterion: Loss function
+    - pred: Model predictions
+    - y_a, y_b: The two sets of labels
+    - lam: Mixing weight
+    
+    Returns:
+    - Weighted loss
+    """
+    # Weighted average of losses for the two label sets
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+def plot_learning_curves(epochs, train_losses, val_losses, val_accuracies, per_class_f1, class_names, save_path):
+    """
+    Plot and save learning curves to visualize training progress.
+    
+    Parameters:
+    - epochs: List of epoch numbers
+    - train_losses, val_losses: Training and validation losses
+    - val_accuracies: Validation accuracies
+    - per_class_f1: F1 scores for each class
+    - class_names: Names of the damage classes
+    - save_path: Where to save the plot
+    """
+    plt.figure(figsize=(16, 12))  # Create a large figure
+    
+    # 1. Plot loss curves
+    plt.subplot(2, 2, 1)  # First subplot (top-left)
+    plt.plot(epochs, train_losses, label="Train Loss", marker='o', color='blue')
+    plt.plot(epochs, val_losses, label="Val Loss", marker='o', color='red')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # 2. Plot validation accuracy
+    plt.subplot(2, 2, 2)  # Second subplot (top-right)
+    plt.plot(epochs, val_accuracies, label="Val Accuracy (%)", marker='o', color='green')
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Validation Accuracy")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # 3. Plot per-class F1 scores
+    plt.subplot(2, 2, 3)  # Third subplot (bottom-left)
+    per_class_f1 = np.array(per_class_f1)  # Convert to numpy array
+    for i, cls_name in enumerate(class_names):
+        plt.plot(epochs, per_class_f1[:, i], label=f"{cls_name}", marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("F1 Score")
+    plt.title("Per-Class F1 Scores")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # 4. Plot final F1 scores
+    plt.subplot(2, 2, 4)  # Fourth subplot (bottom-right)
+    plt.bar(class_names, [per_class_f1[-1, i] for i in range(len(class_names))])
+    plt.xlabel("Class")
+    plt.ylabel("Final F1 Score")
+    plt.title("Final F1 Score by Class")
+    plt.xticks(rotation=45)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Learning curves plot saved to {save_path}")
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for handling class imbalance.
+    This loss function gives more weight to hard examples and down-weights easy examples.
+    
+    It's particularly useful when one class (like 'no-damage') is much more common than others.
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        """
+        Initialize the focal loss.
+        
+        Parameters:
+        - alpha: Class weights (optional)
+        - gamma: Focusing parameter (higher = more focus on hard examples)
+        - reduction: How to reduce the loss ('mean', 'sum', or None)
+        """
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # Weight for each class
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Compute the focal loss.
+        
+        Parameters:
+        - inputs: Model predictions (logits)
+        - targets: Ground truth labels
+        
+        Returns:
+        - Loss value
+        """
+        # First compute standard cross entropy loss
+        ce_loss = torch.nn.functional.cross_entropy(
+            inputs, targets, reduction='none', weight=self.alpha
+        )
+        
+        # Then compute focal weights
+        pt = torch.exp(-ce_loss)  # Probability of the correct class
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss)  # Apply focal weighting
+        
+        # Apply reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
+def main():
+    """Main training function."""
+    # Start timing
+    start_time = time.time()
+    
+    # Create timestamp for this training run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Set random seed for reproducibility
+    seed_everything(42)
+    
+    # Hyperparameters & settings
+    root_dir = os.path.join(project_root, "data", "xBD")  # Path to dataset
+    crop_size = 224  # Size of image crops
+    batch_size = 64  # Number of samples per batch
+    lr = 0.0001  # Learning rate
+    num_epochs = 10  # Number of training epochs
+    val_ratio = 0.15  # Percentage of data to use for validation
+    use_focal_loss = True  # Whether to use focal loss
+    use_mixup = True  # Whether to use mixup augmentation
+    weight_scale = 0.8  # How strongly to weight rare classes (increased from 0.7)
+    use_amp = True  # Whether to use automatic mixed precision
+    
+    # Create output directories for saving results
+    output_dir = os.path.join(project_root, "output", f"single_branch_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    model_dir = os.path.join(output_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+    pictures_dir = os.path.join(output_dir, "pictures")
+    os.makedirs(pictures_dir, exist_ok=True)
+    
+    # Save configuration parameters
+    config = {
+        "timestamp": timestamp,
+        "model_type": "single_branch",
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "num_epochs": num_epochs,
+        "val_ratio": val_ratio,
+        "use_focal_loss": use_focal_loss,
+        "use_mixup": use_mixup,
+        "weight_scale": weight_scale,
+        "use_amp": use_amp,
+    }
+    
+    with open(os.path.join(output_dir, "config.txt"), "w") as f:
+        for key, value in config.items():
+            f.write(f"{key}: {value}\n")
+
+    # Choose device (GPU or CPU)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Load dataset
+    print("Initializing XBDPatchDataset for training...")
+    full_dataset = XBDPatchDataset(
+        root_dir=root_dir,
+        crop_size=crop_size,
+        use_xy=True,
+        max_samples=None,  # Use all samples
+        augment=True  # Use data augmentation
+    )
+    total_samples = len(full_dataset)
+    print(f"Total samples: {total_samples}")
+
+    # Create stratified train-val split
+    def create_stratified_split(dataset, val_ratio=0.15, seed=42):
+        """
+        Split dataset into training and validation sets,
+        ensuring that each class is represented proportionally.
+        """
+        random.seed(seed)
+        np.random.seed(seed)
+        
+        # Group samples by label
+        label_to_indices = {}
+        for idx, sample in enumerate(dataset.samples):
+            label = sample['label']
+            if label not in label_to_indices:
+                label_to_indices[label] = []
+            label_to_indices[label].append(idx)
+        
+        train_indices = []
+        val_indices = []
+        
+        # For each class, take val_ratio% for validation and the rest for training
+        for label, indices in label_to_indices.items():
+            random.shuffle(indices)  # Shuffle to ensure randomness
+            val_size = int(len(indices) * val_ratio)
+            val_indices.extend(indices[:val_size])
+            train_indices.extend(indices[val_size:])
+        
+        # Shuffle again
+        random.shuffle(train_indices)
+        random.shuffle(val_indices)
+        
+        return train_indices, val_indices
+    
+    # Split data into training and validation sets
+    train_indices, val_indices = create_stratified_split(full_dataset, val_ratio, seed=42)
+    print(f"Training samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
+
+    # Create Subset datasets
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    
+    # Compute class weights to handle imbalance
+    sample_weights, class_weights = compute_sample_weights(full_dataset, train_indices, weight_scale)
+    
+    # Create a weighted sampler for training
+    # This ensures that rare classes appear more frequently in training
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,  # Weight for each sample
+        num_samples=len(sample_weights),  # Sample with replacement
+        replacement=True  # Allow the same sample to appear multiple times
+    )
+    
+    # Create DataLoaders for efficient batch loading
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        sampler=sampler,  # Use the weighted sampler
+        num_workers=8,  # Number of parallel workers
+        pin_memory=True,  # Pin memory for faster GPU transfer
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2,  # Prefetch batches
+        drop_last=True  # Drop the last incomplete batch
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size * 2,  # Larger batch size for validation
+        shuffle=False,  # No need to shuffle validation data
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # Initialize model
+    try:
+        # Create model with dropout for regularization
+        model = BaselineModel(num_classes=4, dropout_rate=0.5).to(device)
+        print("Using BaselineModel with dropout_rate=0.5")
+    except TypeError:
+        # Fall back to simpler initialization if above fails
+        print("Warning: using default initialization")
+        model = BaselineModel(num_classes=4).to(device)
+    
+    # Create weight tensor for loss function
+    weight_tensor = torch.tensor([class_weights.get(i, 1.0) for i in range(4)], dtype=torch.float).to(device)
+    
+    # Initialize loss function
+    if use_focal_loss:
+        criterion = FocalLoss(alpha=weight_tensor, gamma=2.0, reduction='mean')
+        print("Using Focal Loss with gamma=2.0")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        print("Using Weighted CrossEntropyLoss")
+    
+    # Initialize optimizer with weight decay (L2 regularization)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Initialize learning rate scheduler
+    # This varies the learning rate during training for better convergence
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=lr * 10,  # Peak learning rate
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,  # Percentage of training to increase LR
+        anneal_strategy='cos',  # Cosine annealing
+        div_factor=10.0,  # Initial LR = max_lr/div_factor
+        final_div_factor=100.0  # Final LR = initial_lr/final_div_factor
+    )
+
+    # Initialize mixed precision training
+    # This uses lower precision (float16) where possible for speed
+    scaler = GradScaler() if use_amp else None
+    
+    # Training metrics tracking
+    epochs_list = []
+    train_losses = []
+    val_losses = []
+    val_accuracies = []
+    per_class_f1_scores = []
+    best_f1_score = 0.0  # Track best validation F1 score
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        # Set model to training mode
+        model.train()
+        
+        # Initialize metrics for this epoch
+        running_loss = 0.0
+        epoch_start_time = time.time()
+        data_time = 0  # Time spent loading data
+        compute_time = 0  # Time spent on computation
+        batch_start_time = time.time()
+        
+        # Create progress bar for training
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
+        
+        # Training batches
+        for images, labels in train_pbar:
+            # Measure data loading time
+            data_time += time.time() - batch_start_time
+            
+            # Move data to device (GPU)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            # Apply mixup data augmentation
+            mixup_applied = False
+            if use_mixup and np.random.random() < 0.5:
+                images, labels_a, labels_b, lam = mixup_data(
+                    images, labels, alpha=0.2, device=device)
+                mixup_applied = True
+
+            # Zero gradients
+            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+            
+            # Forward pass and loss calculation
+            if use_amp:
+                # Using mixed precision
+                with autocast():
+                    outputs = model(images)
+                    if mixup_applied:
+                        loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                    else:
+                        loss = criterion(outputs, labels)
+                
+                # Backward pass with scaling
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard precision
+                outputs = model(images)
+                if mixup_applied:
+                    loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                else:
+                    loss = criterion(outputs, labels)
+                    
+                loss.backward()
+                optimizer.step()
+                
+            # Update learning rate
+            scheduler.step()
+            
+            # Update metrics
+            running_loss += loss.item()
+            compute_time += time.time() - batch_start_time - data_time
+            
+            # Update progress bar
+            current_lr = scheduler.get_last_lr()[0]
+            train_pbar.set_postfix({
+                "loss": f"{loss.item():.4f}", 
+                "lr": f"{current_lr:.6f}",
+                "data_time": f"{data_time/train_pbar.n:.3f}s/it",
+                "compute_time": f"{compute_time/train_pbar.n:.3f}s/it"
+            })
+            
+            # Reset timing
+            batch_start_time = time.time()
+            
+        # Compute average training loss
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Print timing statistics
+        print(f"Epoch {epoch+1} training - Data time: {data_time:.2f}s, Compute time: {compute_time:.2f}s")
+        
+        # Validation phase
+        model.eval()  # Set model to evaluation mode
+        val_loss_epoch = 0.0
+        correct = 0
+        total = 0
+        all_preds = []
+        all_labels = []
+        val_start_time = time.time()
+        
+        # No gradients needed for validation
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [VAL]", leave=True)
+            for images, labels in val_pbar:
+                # Move data to device
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                # Forward pass
+                if use_amp:
+                    with autocast():
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                else:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                    
+                # Update metrics
+                val_loss_epoch += loss.item()
+                
+                # Get predictions
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                
+                # Store predictions and labels for F1 calculation
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+                # Update progress bar
+                val_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                
+        # Compute validation metrics
+        val_time = time.time() - val_start_time
+        val_loss_epoch /= len(val_loader)
+        val_losses.append(val_loss_epoch)
+        val_acc = 100 * correct / total if total > 0 else 0
+        val_accuracies.append(val_acc)
+        
+        # Calculate F1 scores for each class
+        epoch_f1 = f1_score(all_labels, all_preds, average=None, labels=[0, 1, 2, 3])
+        per_class_f1_scores.append(epoch_f1)
+        
+        # Calculate macro (average) F1 score
+        macro_f1 = np.mean(epoch_f1)
+        epochs_list.append(epoch + 1)
+        
+        # Calculate elapsed time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Print epoch summary
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {val_loss_epoch:.4f} | "
+              f"Val Acc: {val_acc:.2f}% | "
+              f"Macro F1: {macro_f1:.4f} | "
+              f"Time: {epoch_time:.1f}s (Val: {val_time:.1f}s)")
+        
+        # Print per-class F1 scores
+        print(f"Per-class F1 Scores: {', '.join([f'{c}: {f:.4f}' for c, f in zip(DAMAGE_LABELS.keys(), epoch_f1)])}")
+        
+        # Save the model if it's the best so far
+        if macro_f1 > best_f1_score:
+            best_f1_score = macro_f1
+            best_model_path = os.path.join(model_dir, f"best_model_epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved with Macro F1: {best_f1_score:.4f}")
+
+    # Save the final model
+    final_save_path = os.path.join(project_root, "single_branch_final.pt")
+    torch.save(model.state_dict(), final_save_path)
+    print(f"Final model saved to {final_save_path}")
+    
+    # Create learning curves plot
+    plot_save_path = os.path.join(pictures_dir, "learning_curves.png")
+    plot_learning_curves(
+        epochs_list, 
+        train_losses, 
+        val_losses, 
+        val_accuracies, 
+        per_class_f1_scores,
+        list(DAMAGE_LABELS.keys()),
+        plot_save_path
+    )
+    
+    # Save all training metrics to file
+    metrics = {
+        "epochs": epochs_list,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_accuracies": val_accuracies,
+        "per_class_f1_scores": per_class_f1_scores,
+    }
+    
+    metrics_path = os.path.join(output_dir, "training_metrics.txt")
+    with open(metrics_path, "w") as f:
+        for key, values in metrics.items():
+            if key == "per_class_f1_scores":
+                f.write(f"{key}:\n")
+                for epoch_idx, epoch_scores in enumerate(values):
+                    f.write(f"  Epoch {epoch_idx+1}: {epoch_scores}\n")
+            else:
+                f.write(f"{key}: {values}\n")
+    
+    # Print summary
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time/60:.2f} minutes")
+    print(f"Best validation Macro F1: {best_f1_score:.4f}")
+    print(f"All training artifacts saved to {output_dir}")
+    print("Run 'evaluate_baseline.py' to test the model")
+
+if __name__ == "__main__":
+    main()
+
+
+evaluate_baseline:
+#!/usr/bin/env python3
+import os                             # For handling file paths
+import sys                            # For system operations
+import random                         # For random operations
+import torch                          # PyTorch deep learning library
+import torch.nn as nn                 # Neural network modules
+import torch.nn.functional as F       # Additional PyTorch functions
+from torch.utils.data import DataLoader  # For loading data in batches
+from tqdm import tqdm                 # Progress bar
+import numpy as np                    # For numerical operations
+import matplotlib.pyplot as plt       # For plotting
+import seaborn as sns                 # For advanced plotting
+from sklearn.metrics import (         # Various evaluation metrics
+    confusion_matrix, classification_report,
+    f1_score, precision_score, recall_score,
+    cohen_kappa_score, balanced_accuracy_score,
+    accuracy_score
+)
+import time                           # For timing
+from datetime import datetime         # For timestamps
+
+# Add project root to Python's path so we can import our modules
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.append(project_root)
+
+# Import our custom model and dataset
+from overlaying_labels.models.baseline_model import BaselineModel
+from options.utils.data_loader import XBDPatchDataset, DAMAGE_LABELS
+
+# ============ CONFIGURATION ============
+# Update these variables to match your training setup
+TRAINING_TRY = "trainingTry8"  # Change this to your current training try folder
+MODEL_FILENAME = "baseline_best.pt"  # Change this if needed (e.g., "best_model_epoch_5.pt")
+USE_TTA = True  # Whether to use test-time augmentation
+# ======================================
+
+def seed_everything(seed=42):
+    """
+    Set random seeds for reproducibility.
+    This ensures that the same 'random' operations produce the same results across runs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to {seed}")
+
+def test_time_augmentation(model, images, device, num_augments=4):
+    """
+    Apply test-time augmentation (TTA).
+    TTA runs the model on multiple augmented versions of the same input and averages the results.
+    This often improves accuracy by making the model more robust to small variations.
+    
+    Parameters:
+    - model: The model to evaluate
+    - images: Input image tensors
+    - device: Device to use (cuda or cpu)
+    - num_augments: Number of augmentations to use
+    
+    Returns:
+    - Averaged model outputs
+    """
+    model.eval()  # Set model to evaluation mode
+    batch_size = images.size(0)
+    
+    # Original prediction (no augmentation)
+    with torch.no_grad():
+        outputs_original = model(images)
+    
+    # Store all outputs
+    all_outputs = [outputs_original]
+    
+    # Horizontal flip augmentation
+    with torch.no_grad():
+        # Flip images horizontally
+        hflip = torch.flip(images, dims=[3])  # Flip along width dimension
+        # Get predictions
+        outputs_hflip = model(hflip)
+        all_outputs.append(outputs_hflip)
+    
+    # Vertical flip augmentation
+    with torch.no_grad():
+        # Flip images vertically
+        vflip = torch.flip(images, dims=[2])  # Flip along height dimension
+        # Get predictions
+        outputs_vflip = model(vflip)
+        all_outputs.append(outputs_vflip)
+    
+    # Both horizontal and vertical flip
+    with torch.no_grad():
+        # Flip images both ways
+        hvflip = torch.flip(images, dims=[2, 3])
+        # Get predictions
+        outputs_hvflip = model(hvflip)
+        all_outputs.append(outputs_hvflip)
+    
+    # Average all outputs
+    outputs = torch.stack(all_outputs).mean(dim=0)
+    return outputs
+
+def evaluate_model(model, dataloader, device, use_tta=False):
+    """
+    Evaluate the model's performance on a dataset.
+    
+    Parameters:
+    - model: The trained model to evaluate
+    - dataloader: DataLoader with the evaluation dataset
+    - device: Device to use (cuda or cpu)
+    - use_tta: Whether to use test-time augmentation
+    
+    Returns:
+    - accuracy: Overall accuracy percentage
+    - preds: Array of model predictions
+    - labels: Array of true labels
+    - probs: Array of prediction probabilities
+    """
+    model.eval()  # Set model to evaluation mode
+    correct = 0   # Counter for correct predictions
+    total = 0     # Counter for total predictions
+    all_preds = []    # Store all predictions
+    all_labels = []   # Store all true labels
+    all_probs = []    # Store all prediction probabilities
+    
+    # Disable gradient calculation for evaluation (saves memory and computation)
+    with torch.no_grad():
+        # Create progress bar
+        pbar = tqdm(dataloader, desc="Evaluating", leave=True)
+        
+        # Process each batch - NOTE: For single branch model, we use only post_imgs
+        for pre_imgs, post_imgs, labels in pbar:
+            # Move data to device - use ONLY the post-disaster images for single-branch
+            images = post_imgs.to(device)
+            labels = labels.to(device)
+            
+            # Either use test-time augmentation or standard forward pass
+            if use_tta:
+                # Apply test-time augmentation (prediction with multiple augmented views)
+                outputs = test_time_augmentation(model, images, device)
+            else:
+                # Standard forward pass
+                outputs = model(images)
+            
+            # Convert logits to probabilities
+            probabilities = F.softmax(outputs, dim=1)
+            
+            # Get the predicted class (highest probability)
+            _, preds = torch.max(outputs, 1)
+            
+            # Update counters
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+            # Store predictions and labels for later analysis
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probabilities.cpu().numpy())
+            
+            # Update progress bar with current accuracy
+            pbar.set_postfix({"Acc": f"{100 * correct / total:.2f}%"})
+    
+    # Calculate overall accuracy
+    accuracy = 100 * correct / total if total > 0 else 0
+    
+    return accuracy, np.array(all_preds), np.array(all_labels), np.array(all_probs)
+
+def plot_confusion_matrix(cm, target_names, save_path, normalize=False, title=None):
+    """
+    Plot and save a confusion matrix.
+    
+    Parameters:
+    - cm: Confusion matrix from sklearn
+    - target_names: Names of the classes
+    - save_path: Where to save the plot
+    - normalize: Whether to normalize values (as percentages)
+    - title: Title for the plot
+    """
+    # Normalize if requested
+    if normalize:
+        cm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
+        fmt = '.2f'  # Format as float with 2 decimal places
+    else:
+        fmt = 'd'    # Format as integer
+    
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    
+    # Plot confusion matrix as heatmap
+    sns.heatmap(
+        cm,                   # The confusion matrix
+        annot=True,           # Show values in cells
+        fmt=fmt,              # Value format
+        cmap="Blues",         # Color map (blue gradient)
+        xticklabels=target_names,  # X-axis labels (predicted classes)
+        yticklabels=target_names   # Y-axis labels (true classes)
+    )
+    
+    # Add labels and title
+    plt.ylabel('True Label', fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=14)
+    
+    if title:
+        plt.title(title, fontsize=16)
+    else:
+        plt.title("Confusion Matrix", fontsize=16)
+    
+    # Save and close
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Confusion matrix plot saved to {save_path}")
+
+def plot_per_class_metrics(metrics, metric_name, target_names, save_path):
+    """
+    Plot and save metrics for each class.
+    
+    Parameters:
+    - metrics: Array of metric values for each class
+    - metric_name: Name of the metric (e.g., "F1 Score")
+    - target_names: Names of the classes
+    - save_path: Where to save the plot
+    """
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    
+    # Create bar plot
+    x = np.arange(len(target_names))
+    plt.bar(x, metrics, color='skyblue')
+    
+    # Add labels and formatting
+    plt.xticks(x, target_names)
+    plt.ylim(0, 1)  # Metrics are typically in [0,1] range
+    plt.xlabel("Classes", fontsize=12)
+    plt.ylabel(metric_name, fontsize=12)
+    plt.title(f"Per-Class {metric_name}", fontsize=14)
+    
+    # Add value labels on top of each bar
+    for i, v in enumerate(metrics):
+        plt.text(i, v + 0.02, f"{v:.2f}", ha='center', fontsize=10)
+    
+    # Save and close
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Per-class {metric_name} plot saved to {save_path}")
+
+def plot_roc_curves(all_probs, all_labels, target_names, save_path):
+    """
+    Plot ROC curves for multi-class classification.
+    
+    Parameters:
+    - all_probs: Prediction probabilities
+    - all_labels: True labels
+    - target_names: Names of the classes
+    - save_path: Where to save the plot
+    """
+    from sklearn.metrics import roc_curve, auc
+    
+    # Create figure
+    plt.figure(figsize=(12, 8))
+    
+    # Number of classes
+    n_classes = len(target_names)
+    
+    # Convert labels to one-hot encoding
+    y_true_onehot = np.eye(n_classes)[all_labels]
+    
+    # Different colors for each class
+    colors = ['blue', 'orange', 'green', 'red']
+    
+    # Plot ROC curve for each class
+    for i, color, target_name in zip(range(n_classes), colors, target_names):
+        # Compute ROC curve
+        fpr, tpr, _ = roc_curve(y_true_onehot[:, i], all_probs[:, i])
+        # Compute area under curve
+        roc_auc = auc(fpr, tpr)
+        # Plot this class
+        plt.plot(fpr, tpr, color=color, lw=2, 
+                 label=f'{target_name} (AUC = {roc_auc:.3f})')
+    
+    # Plot diagonal reference line (random classifier)
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    
+    # Set plot limits and labels
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title('ROC Curves', fontsize=14)
+    plt.legend(loc="lower right")
+    
+    # Save and close
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"ROC curves plot saved to {save_path}")
+
+def analyze_errors(all_preds, all_labels, all_probs, target_names, save_path):
+    """
+    Analyze prediction errors and generate visualizations.
+    
+    Parameters:
+    - all_preds: Model predictions
+    - all_labels: True labels
+    - all_probs: Prediction probabilities
+    - target_names: Names of the classes
+    - save_path: Where to save the plot
+    """
+    # Create figure
+    plt.figure(figsize=(12, 8))
+    
+    # Find indices of correct and incorrect predictions
+    error_idx = np.where(all_preds != all_labels)[0]  # Incorrect predictions
+    correct_idx = np.where(all_preds == all_labels)[0]  # Correct predictions
+    
+    # Analyze error rates for each true class
+    error_rates = []
+    error_types = []
+    
+    for true_class in range(len(target_names)):
+        # Find all samples of this class
+        class_samples = np.where(all_labels == true_class)[0]
+        # Find errors for this class
+        class_errors = np.intersect1d(class_samples, error_idx)
+        # Calculate error rate
+        error_rate = len(class_errors) / len(class_samples) if len(class_samples) > 0 else 0
+        error_rates.append(error_rate)
+        
+        # Analyze what classes these samples are being misclassified as
+        if len(class_errors) > 0:
+            error_preds = all_preds[class_errors]
+            unique_preds, counts = np.unique(error_preds, return_counts=True)
+            most_common_idx = np.argmax(counts)
+            most_common_class = unique_preds[most_common_idx]
+            error_types.append(f"{target_names[true_class]} → {target_names[most_common_class]}")
+        else:
+            error_types.append("No errors")
+    
+    # Plot error rates by class
+    plt.subplot(2, 1, 1)
+    bars = plt.bar(target_names, error_rates, color=['#ff9999', '#66b3ff', '#99ff99', '#ffcc99'])
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.02, f'{height:.2f}', 
+                ha='center', fontsize=10)
+    plt.title("Error Rate by True Class", fontsize=14)
+    plt.ylabel("Error Rate", fontsize=12)
+    plt.ylim(0, max(error_rates) + 0.1)
+    
+    # Plot confidence distribution for correct vs incorrect predictions
+    plt.subplot(2, 1, 2)
+    # Extract confidence scores (probability of predicted class)
+    confidences = np.array([all_probs[i, pred] for i, pred in enumerate(all_preds)])
+    correct_conf = confidences[correct_idx]  # Confidences for correct predictions
+    error_conf = confidences[error_idx]      # Confidences for incorrect predictions
+    
+    # Plot histograms
+    plt.hist(correct_conf, bins=20, alpha=0.5, 
+             label=f'Correct (n={len(correct_conf)})', color='green')
+    plt.hist(error_conf, bins=20, alpha=0.5, 
+             label=f'Incorrect (n={len(error_conf)})', color='red')
+    plt.xlabel("Prediction Confidence", fontsize=12)
+    plt.ylabel("Count", fontsize=12)
+    plt.title("Confidence Distribution for Correct vs. Incorrect Predictions", fontsize=14)
+    plt.legend()
+    
+    # Save and close
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Error analysis plot saved to {save_path}")
+    
+    # Print error analysis summary
+    print("\nError Analysis Summary:")
+    for i, error in enumerate(error_types):
+        print(f"  - {target_names[i]}: {error} (Error rate: {error_rates[i]:.2f})")
+
+def main():
+    """Main evaluation function."""
+    # Set random seed for reproducibility
+    seed_everything(42)
+    
+    # Use configuration from the top of the file
+    training_try = TRAINING_TRY
+    model_filename = MODEL_FILENAME
+    use_tta = USE_TTA
+    
+    # Choose device (GPU or CPU)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Create timestamp for this evaluation run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Path to test data
+    test_data_dir = os.path.join(project_root, "data", "test")
+    print(f"Loading evaluation data from: {test_data_dir}")
+
+    # Create output directories
+    output_dir = os.path.join(project_root, "evaluation_results", f"{training_try}_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    pictures_dir = os.path.join(output_dir, "pictures")
+    os.makedirs(pictures_dir, exist_ok=True)
+
+    # Load test dataset using the ORIGINAL parameters that your implementation accepts
+    # We'll still only use the post-disaster images in the evaluate_model function
+    test_dataset = XBDPatchDataset(
+        root_dir=test_data_dir,
+        pre_crop_size=128,   # Keep original parameter names
+        post_crop_size=224,  # Keep original parameter names
+        use_xy=True,
+        max_samples=None
+    )
+    
+    print(f"Total evaluation samples: {len(test_dataset)}")
+
+    # Create DataLoader for efficient batch processing
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=32,   # Batch size
+        shuffle=False,   # No need to shuffle test data
+        num_workers=4,   # Number of parallel workers
+        pin_memory=True  # Pin memory for faster GPU transfer
+    )
+
+    # Initialize model - now we only have one branch
+    model = BaselineModel(num_classes=4).to(device)
+    
+    # Load trained model weights - use the path to the training try folder
+    checkpoint_path = os.path.join(project_root, "output", training_try, "models", model_filename)
+    if os.path.isfile(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded model weights from {checkpoint_path}")
+    else:
+        print(f"Model checkpoint not found at {checkpoint_path}")
+        return
+
+    # Evaluate model
+    print(f"Starting evaluation{' with test-time augmentation' if use_tta else ''}...")
+    accuracy, preds, labels, probs = evaluate_model(model, test_loader, device, use_tta=use_tta)
+    print(f"\nFinal Evaluation Accuracy: {accuracy:.2f}%\n")
+    
+    # Get class names
+    target_names = list(DAMAGE_LABELS.keys())
+    
+    # Compute confusion matrix
+    conf_matrix = confusion_matrix(labels, preds, labels=[0, 1, 2, 3])
+    print("Confusion Matrix:")
+    print(conf_matrix)
+    
+    # Generate classification report
+    report = classification_report(labels, preds, target_names=target_names, digits=4)
+    print("\nClassification Report:")
+    print(report)
+    
+    # Calculate additional metrics
+    macro_f1 = f1_score(labels, preds, average='macro')
+    weighted_f1 = f1_score(labels, preds, average='weighted')
+    macro_precision = precision_score(labels, preds, average='macro')
+    weighted_precision = precision_score(labels, preds, average='weighted')
+    macro_recall = recall_score(labels, preds, average='macro')
+    weighted_recall = recall_score(labels, preds, average='weighted')
+    kappa = cohen_kappa_score(labels, preds)
+    bal_accuracy = balanced_accuracy_score(labels, preds)
+    
+    # Print additional metrics
+    print("Additional Metrics:")
+    print(f"Macro F1 Score: {macro_f1:.4f}")
+    print(f"Weighted F1 Score: {weighted_f1:.4f}")
+    print(f"Macro Precision: {macro_precision:.4f}")
+    print(f"Weighted Precision: {weighted_precision:.4f}")
+    print(f"Macro Recall: {macro_recall:.4f}")
+    print(f"Weighted Recall: {weighted_recall:.4f}")
+    print(f"Cohen's Kappa: {kappa:.4f}")
+    print(f"Balanced Accuracy: {bal_accuracy:.4f}")
+    
+    # Save detailed results to a file
+    results_path = os.path.join(output_dir, f"evaluation_results.txt")
+    with open(results_path, 'w') as f:
+        f.write(f"Evaluation Results for {training_try}/{model_filename}\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Test-Time Augmentation: {use_tta}\n\n")
+        f.write("Confusion Matrix:\n")
+        f.write(str(conf_matrix) + "\n\n")
+        f.write("Classification Report:\n")
+        f.write(report + "\n\n")
+        f.write("Additional Metrics:\n")
+        f.write(f"Accuracy: {accuracy:.4f}%\n")
+        f.write(f"Macro F1 Score: {macro_f1:.4f}\n")
+        f.write(f"Weighted F1 Score: {weighted_f1:.4f}\n")
+        f.write(f"Macro Precision: {macro_precision:.4f}\n")
+        f.write(f"Weighted Precision: {weighted_precision:.4f}\n")
+        f.write(f"Macro Recall: {macro_recall:.4f}\n")
+        f.write(f"Weighted Recall: {weighted_recall:.4f}\n")
+        f.write(f"Cohen's Kappa: {kappa:.4f}\n")
+        f.write(f"Balanced Accuracy: {bal_accuracy:.4f}\n")
+    print(f"Detailed evaluation results saved to {results_path}")
+    
+    # Generate visualizations
+    print(f"Saving visualizations to {pictures_dir}")
+    
+    # Plot confusion matrix
+    cm_save_path = os.path.join(pictures_dir, "confusion_matrix.png")
+    plot_confusion_matrix(conf_matrix, target_names, cm_save_path, 
+                         title=f"Confusion Matrix (Accuracy: {accuracy:.2f}%)")
+    
+    # Plot normalized confusion matrix (percentages)
+    cm_norm_save_path = os.path.join(pictures_dir, "confusion_matrix_normalized.png")
+    plot_confusion_matrix(conf_matrix, target_names, cm_norm_save_path, normalize=True,
+                         title="Normalized Confusion Matrix")
+    
+    # Plot per-class metrics
+    try:
+        # F1 score by class
+        per_class_f1 = f1_score(labels, preds, average=None, labels=[0, 1, 2, 3])
+        f1_save_path = os.path.join(pictures_dir, "per_class_f1.png")
+        plot_per_class_metrics(per_class_f1, "F1 Score", target_names, f1_save_path)
+        
+        # Precision by class
+        per_class_precision = precision_score(labels, preds, average=None, labels=[0, 1, 2, 3])
+        precision_save_path = os.path.join(pictures_dir, "per_class_precision.png")
+        plot_per_class_metrics(per_class_precision, "Precision", target_names, precision_save_path)
+        
+        # Recall by class
+        per_class_recall = recall_score(labels, preds, average=None, labels=[0, 1, 2, 3])
+        recall_save_path = os.path.join(pictures_dir, "per_class_recall.png")
+        plot_per_class_metrics(per_class_recall, "Recall", target_names, recall_save_path)
+        
+        # ROC curves
+        roc_save_path = os.path.join(pictures_dir, "roc_curves.png")
+        plot_roc_curves(probs, labels, target_names, roc_save_path)
+        
+        # Error analysis
+        error_save_path = os.path.join(pictures_dir, "error_analysis.png")
+        analyze_errors(preds, labels, probs, target_names, error_save_path)
+    except Exception as e:
+        print(f"Error generating some plots: {e}")
+    
+    # Print sample predictions
+    print("\nSample Predictions:")
+    for i in range(min(5, len(preds))):
+        true_label = labels[i]
+        pred_label = preds[i]
+        confidence = probs[i, pred_label]
+        print(f"Sample {i}: True Label: {true_label}, Predicted: {pred_label}, Confidence: {confidence:.4f}")
+
+if __name__ == "__main__":
+    main()
+
+data_loader:
+import os                  # For handling file paths
+import json                # For reading JSON files
+import torch               # PyTorch library for deep learning
+import random              # For random sampling
+from torch.utils.data import Dataset  # Base class for PyTorch datasets
+from PIL import Image      # For loading and processing images
+import torchvision.transforms as T    # For image transformations
+from shapely import wkt    # For handling geometric shapes (Well-Known Text format)
+
+# Dictionary mapping damage labels to numeric classes
+# This is how we convert text labels to numbers that the model can understand
+DAMAGE_LABELS = {
+    "no-damage": 0,
+    "minor-damage": 1,
+    "major-damage": 2,
+    "destroyed": 3
+}
+
+class XBDPatchDataset(Dataset):
+    """
+    Dataset class for the xBD satellite imagery dataset.
+    
+    Modified to only use post-disaster images:
+    1. Still scans through all the disaster folders
+    2. For each disaster, loads building polygons and their damage labels
+    3. Crops only the post-disaster images around each building
+    4. Returns these image crops with their damage labels for training
+    """
+    def __init__(self,
+                 root_dir,              # Base directory containing all the data
+                 crop_size=224,         # Size to crop the post-disaster images
+                 use_xy=True,           # Whether to use xy coordinates (vs lng/lat)
+                 max_samples=None,      # Limit on number of samples (optional)
+                 augment=False):        # Whether to use data augmentation
+        """
+        Initialize the dataset by specifying where to find the data and how to process it.
+        """
+        super().__init__()
+        self.root_dir = root_dir
+        self.crop_size = crop_size
+        self.coord_key = "xy" if use_xy else "lng_lat"  # Coordinate system to use
+        self.max_samples = max_samples
+        self.augment = augment
+
+        # Define image transformations
+        # These convert the PIL images to PyTorch tensors and normalize them
+        if self.augment:
+            # Transformations with data augmentation for training
+            self.transform = T.Compose([
+                T.Resize((crop_size, crop_size)),  # Resize to desired dimensions
+                T.RandomHorizontalFlip(p=0.5),    # 50% chance of horizontal flip
+                T.RandomVerticalFlip(p=0.3),      # 30% chance of vertical flip
+                T.RandomRotation(20),             # Random rotation up to 20 degrees
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.1),  # Color variations
+                T.ToTensor(),  # Convert PIL image to tensor (0-1 range)
+                T.Normalize(   # Normalize using ImageNet statistics
+                    mean=[0.485, 0.456, 0.406],  # RGB channel means
+                    std=[0.229, 0.224, 0.225]     # RGB channel standard deviations
+                )
+            ])
+        else:
+            # Basic transformations for validation/testing (no augmentation)
+            self.transform = T.Compose([
+                T.Resize((crop_size, crop_size)),
+                T.ToTensor(),
+                T.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                )
+            ])
+
+        # Gather all the samples (buildings with damage labels)
+        self.samples = self._gather_samples()
+        
+        # If max_samples is specified, randomly sample that many buildings
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = random.sample(self.samples, self.max_samples)
+
+    def _gather_samples(self):
+        """
+        Scan all disaster folders and collect post-disaster images with building locations and damage labels.
+        Returns a list of dictionaries, each containing information about one building.
+        """
+        samples = []
+        
+        # Check if we're using the flat test directory structure
+        # (with images/ and labels/ subdirectories)
+        images_dir = os.path.join(self.root_dir, "images")
+        labels_dir = os.path.join(self.root_dir, "labels")
+        
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            # Flat structure processing (e.g., for test data)
+            print(f"Processing flat directory structure at {self.root_dir}")
+            
+            # Get all post-disaster JSON files
+            label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+            
+            for label_file in label_files:
+                # Extract the base ID from the filename
+                base_id = label_file.replace("_post_disaster.json", "")
+                post_img_name = base_id + "_post_disaster.png"
+                
+                # Full paths to all files
+                post_json_path = os.path.join(labels_dir, label_file)
+                post_img_path = os.path.join(images_dir, post_img_name)
+                
+                # Skip if any files are missing
+                if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)):
+                    continue
+                
+                # Load the JSON file containing building polygons and damage labels
+                with open(post_json_path, 'r') as f:
+                    post_data = json.load(f)
+                
+                # Extract features (building polygons and their attributes)
+                feats = post_data.get("features", {}).get(self.coord_key, [])
+                
+                # Process each building
+                for feat in feats:
+                    # Get the damage type
+                    damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                    
+                    # Skip buildings with unknown damage types
+                    if damage_type not in DAMAGE_LABELS:
+                        continue
+                    
+                    # Convert damage type to numeric label
+                    label = DAMAGE_LABELS[damage_type]
+                    
+                    # Get building polygon
+                    wkt_str = feat.get("wkt", None)
+                    if wkt_str is None:
+                        continue
+                    
+                    # Parse the WKT string to a geometric shape
+                    polygon = wkt.loads(wkt_str)
+                    
+                    # Get bounding box coordinates
+                    minx, miny, maxx, maxy = polygon.bounds
+                    
+                    # Store the sample
+                    samples.append({
+                        "post_img": post_img_path,      # Path to post-disaster image
+                        "bbox": (minx, miny, maxx, maxy),  # Bounding box of the building
+                        "label": label                  # Damage label (0-3)
+                    })
+        else:
+            # Hierarchical structure (main training data)
+            # Get all disaster folders (hurricanes, floods, etc.)
+            disasters = [
+                d for d in os.listdir(self.root_dir)
+                if os.path.isdir(os.path.join(self.root_dir, d))
+                   and d.lower() != "spacenet_gt"  # Skip this special folder
+            ]
+            
+            print(f"Found {len(disasters)} disaster folders")
+            
+            # Process each disaster
+            for disaster in disasters:
+                disaster_dir = os.path.join(self.root_dir, disaster)
+                images_dir = os.path.join(disaster_dir, "images")
+                labels_dir = os.path.join(disaster_dir, "labels")
+                
+                # Skip if missing images or labels directories
+                if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                    print(f"Warning: Missing images or labels directory for disaster: {disaster}")
+                    continue
+                
+                # Get all post-disaster JSON files
+                label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+                print(f"Disaster {disaster}: Found {len(label_files)} label files")
+                
+                # Process each JSON file (each representing an image tile)
+                for label_file in label_files:
+                    # Extract base ID
+                    base_id = label_file.replace("_post_disaster.json", "")
+                    post_img_name = base_id + "_post_disaster.png"
+                    
+                    # Full paths
+                    post_json_path = os.path.join(labels_dir, label_file)
+                    post_img_path = os.path.join(images_dir, post_img_name)
+                    
+                    # Skip if any files are missing
+                    if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)):
+                        continue
+                    
+                    # Load JSON with building polygons
+                    with open(post_json_path, 'r') as f:
+                        post_data = json.load(f)
+                    
+                    # Extract building features
+                    feats = post_data.get("features", {}).get(self.coord_key, [])
+                    
+                    # Process each building
+                    for feat in feats:
+                        # Get damage type
+                        damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                        
+                        # Skip buildings with unknown damage
+                        if damage_type not in DAMAGE_LABELS:
+                            continue
+                        
+                        # Convert damage type to numeric label
+                        label = DAMAGE_LABELS[damage_type]
+                        
+                        # Get polygon
+                        wkt_str = feat.get("wkt", None)
+                        if wkt_str is None:
+                            continue
+                        
+                        # Parse polygon and get bounding box
+                        polygon = wkt.loads(wkt_str)
+                        minx, miny, maxx, maxy = polygon.bounds
+                        
+                        # Store the sample
+                        samples.append({
+                            "post_img": post_img_path,
+                            "bbox": (minx, miny, maxx, maxy),
+                            "label": label,
+                            "disaster": disaster  # Track which disaster this is from
+                        })
+        
+        # Report statistics
+        print(f"Total gathered samples: {len(samples)}")
+        
+        # Count and report the number of samples in each damage class
+        labels = [s["label"] for s in samples]
+        unique_labels = set(labels)
+        print("Class distribution:")
+        for label in sorted(unique_labels):
+            count = labels.count(label)
+            class_name = [name for name, idx in DAMAGE_LABELS.items() if idx == label][0]
+            print(f"  {class_name}: {count} samples ({count/len(samples)*100:.2f}%)")
+        
+        return samples
+
+    def __len__(self):
+        """Return the total number of samples (buildings)."""
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        """
+        Get a single sample (building) by index.
+        Returns a tuple of (post_image_tensor, label).
+        This is called by the DataLoader during training.
+        """
+        # Get the sample information
+        item = self.samples[idx]
+        post_path = item["post_img"]       # Path to post-disaster image
+        (minx, miny, maxx, maxy) = item["bbox"]  # Building bounding box
+        label = item["label"]              # Damage label (0-3)
+
+        try:
+            # Load the post-disaster image
+            post_img = Image.open(post_path).convert("RGB")
+
+            # Crop the image around the building
+            post_crop = self._center_crop(post_img, minx, miny, maxx, maxy, self.crop_size)
+
+            # Apply transformations to convert to tensor and normalize
+            post_tensor = self.transform(post_crop)
+
+            # Return the post image tensor and the label
+            return post_tensor, label
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            # Return placeholder tensor in case of error
+            placeholder_post = torch.zeros(3, self.crop_size, self.crop_size)
+            return placeholder_post, label
+
+    def _center_crop(self, pil_img, minx, miny, maxx, maxy, crop_size):
+        """
+        Extract a square crop centered on a building from a larger satellite image.
+        
+        Parameters:
+        - pil_img: The full satellite image
+        - minx, miny, maxx, maxy: Building bounding box coordinates
+        - crop_size: Size of square crop to extract
+        
+        Returns:
+        - A square PIL image crop centered on the building
+        """
+        # Get image dimensions
+        width, height = pil_img.size
+        
+        # Calculate building dimensions
+        bb_width = maxx - minx
+        bb_height = maxy - miny
+        
+        # Find the center of the building
+        cx = minx + bb_width / 2.0
+        cy = miny + bb_height / 2.0
+        
+        # Calculate crop boundaries
+        half = crop_size / 2.0
+        left = max(0, min(cx - half, width - crop_size))  # Ensure crop stays within image
+        top = max(0, min(cy - half, height - crop_size))
+        right = left + crop_size
+        bottom = top + crop_size
+        
+        # Extract and return the crop
+        return pil_img.crop((left, top, right, bottom))
+
+# Test the dataset if run directly
+if __name__ == "__main__":
+    dataset = XBDPatchDataset(root_dir="/path/to/data/xBD", augment=True)
+    print(f"Total samples: {len(dataset)}")
+    post_img, label = dataset[0]  # Get the first sample
+    print(f"Post-image shape: {post_img.shape}, Label: {label}")

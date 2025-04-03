@@ -1,0 +1,11 @@
+testing should be done for an individual disaster type
+
+In a real scenario, one would maximize all available
+data for the training and then predict one new disaster
+
+I want to work specifically with fluds
+
+multitemporal inputs make
+it possible to compare the degree of similarity between the two samples 
+
+maybe i could unit no damage with minor damage and have 3 categories?

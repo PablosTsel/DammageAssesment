@@ -1,0 +1,6 @@
+timestamp: 20250327_182931
+batch_size: 16
+learning_rate: 0.0002
+num_epochs: 20
+val_ratio: 0.2
+image_size: 256

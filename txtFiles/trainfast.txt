@@ -1,0 +1,1348 @@
+train_baseline:
+#!/usr/bin/env python3
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
+from tqdm import tqdm
+from collections import Counter
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import f1_score
+import random
+from datetime import datetime
+import time
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
+
+# Add project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.append(project_root)
+
+from overlaying_labels.models.baseline_model import BaselineModel
+from options.utils.data_loader import XBDPatchDataset, DAMAGE_LABELS
+
+def seed_everything(seed=42):
+    import random, numpy as np, torch, os
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    # Enable benchmark mode for faster training when input sizes don't change
+    torch.backends.cudnn.benchmark = True
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to {seed}")
+
+def compute_sample_weights(dataset, indices, weight_scale=1.0):
+    """Compute sample weights for the given dataset indices"""
+    # Extract labels for the given indices
+    labels = [dataset.samples[i]["label"] for i in indices]
+    counts = Counter(labels)
+    total = sum(counts.values())
+    num_classes = len(DAMAGE_LABELS)
+    
+    # Compute inverse frequency weights
+    class_weights = {cls: (total / (num_classes * counts[cls]))**weight_scale for cls in counts}
+    
+    # Create sample weights
+    sample_weights = [class_weights[label] for label in labels]
+    
+    return sample_weights, class_weights
+
+def mixup_data(x1, x2, y, alpha=0.2, device='cuda'):
+    """Applies mixup augmentation to the data"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x1.size()[0]
+    index = torch.randperm(batch_size).to(device)
+
+    mixed_x1 = lam * x1 + (1 - lam) * x1[index, :]
+    mixed_x2 = lam * x2 + (1 - lam) * x2[index, :]
+    y_a, y_b = y, y[index]
+    
+    return mixed_x1, mixed_x2, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Criterion for mixup training"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+def plot_learning_curves(epochs, train_losses, val_losses, val_accuracies, per_class_f1, class_names, save_path):
+    plt.figure(figsize=(16, 12))
+    
+    # Plot loss curves
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs, train_losses, label="Train Loss", marker='o', color='blue')
+    plt.plot(epochs, val_losses, label="Val Loss", marker='o', color='red')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Plot validation accuracy
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs, val_accuracies, label="Val Accuracy (%)", marker='o', color='green')
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Validation Accuracy")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Plot per-class F1 scores
+    plt.subplot(2, 2, 3)
+    per_class_f1 = np.array(per_class_f1)  # shape: (num_epochs, num_classes)
+    for i, cls_name in enumerate(class_names):
+        plt.plot(epochs, per_class_f1[:, i], label=f"{cls_name}", marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("F1 Score")
+    plt.title("Per-Class F1 Scores")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Plot class distribution of last batch
+    plt.subplot(2, 2, 4)
+    plt.bar(class_names, [per_class_f1[-1, i] for i in range(len(class_names))])
+    plt.xlabel("Class")
+    plt.ylabel("Final F1 Score")
+    plt.title("Final F1 Score by Class")
+    plt.xticks(rotation=45)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Learning curves plot saved to {save_path}")
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # Weight for each class
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Use nn.functional directly instead of F
+        ce_loss = torch.nn.functional.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss)
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
+def main():
+    start_time = time.time()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    seed_everything(42)
+    
+    # Hyperparameters & settings
+    root_dir = os.path.join(project_root, "data", "xBD")
+    batch_size = 64  # Increased batch size for better GPU utilization
+    lr = 0.0002  # Adjusted learning rate for larger batch size
+    num_epochs = 10
+    val_ratio = 0.15
+    use_focal_loss = True
+    use_mixup = True  # Re-enabled mixup for better generalization
+    weight_scale = 0.7
+    use_amp = True  # Enable Automatic Mixed Precision
+    
+    # Create output directories
+    output_dir = os.path.join(project_root, "output", f"training_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    model_dir = os.path.join(output_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+    pictures_dir = os.path.join(output_dir, "pictures")
+    os.makedirs(pictures_dir, exist_ok=True)
+    
+    # Save configuration
+    config = {
+        "timestamp": timestamp,
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "num_epochs": num_epochs,
+        "val_ratio": val_ratio,
+        "use_focal_loss": use_focal_loss,
+        "use_mixup": use_mixup,
+        "weight_scale": weight_scale,
+        "use_amp": use_amp,
+    }
+    
+    with open(os.path.join(output_dir, "config.txt"), "w") as f:
+        for key, value in config.items():
+            f.write(f"{key}: {value}\n")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    print("Initializing XBDPatchDataset for training...")
+    full_dataset = XBDPatchDataset(
+        root_dir=root_dir,
+        pre_crop_size=128,
+        post_crop_size=224,
+        use_xy=True,
+        max_samples=None
+    )
+    total_samples = len(full_dataset)
+    print(f"Total samples: {total_samples}")
+
+    # Create stratified train-val split directly
+    def create_stratified_split(dataset, val_ratio=0.15, seed=42):
+        random.seed(seed)
+        np.random.seed(seed)
+        
+        # Group samples by label
+        label_to_indices = {}
+        for idx, sample in enumerate(dataset.samples):
+            label = sample['label']
+            if label not in label_to_indices:
+                label_to_indices[label] = []
+            label_to_indices[label].append(idx)
+        
+        train_indices = []
+        val_indices = []
+        
+        # Stratified sampling
+        for label, indices in label_to_indices.items():
+            random.shuffle(indices)
+            val_size = int(len(indices) * val_ratio)
+            val_indices.extend(indices[:val_size])
+            train_indices.extend(indices[val_size:])
+        
+        random.shuffle(train_indices)
+        random.shuffle(val_indices)
+        
+        return train_indices, val_indices
+    
+    # Create the split
+    train_indices, val_indices = create_stratified_split(full_dataset, val_ratio, seed=42)
+    print(f"Training samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
+
+    # Create train and validation datasets
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    
+    # Compute sample weights for weighted sampling
+    sample_weights, class_weights = compute_sample_weights(full_dataset, train_indices, weight_scale)
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    
+    # Create optimized dataloaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        sampler=sampler, 
+        num_workers=8,  # Reduced to a more optimal value
+        pin_memory=True,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2,  # Prefetch 2 batches per worker
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size * 2,  # Larger batch size for validation (no gradient storage needed)
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # Initialize model - check if pretrained is a valid parameter
+    try:
+        model = BaselineModel(num_classes=4, pretrained=True, dropout_rate=0.5).to(device)
+    except TypeError:
+        # If pretrained is not a valid parameter, try without it
+        print("Warning: 'pretrained' parameter not supported, using default initialization")
+        model = BaselineModel(num_classes=4).to(device)
+    
+    # Define class weights for loss function
+    weight_tensor = torch.tensor([class_weights.get(i, 1.0) for i in range(4)], dtype=torch.float).to(device)
+    
+    # Loss function
+    if use_focal_loss:
+        criterion = FocalLoss(alpha=weight_tensor, gamma=2.0, reduction='mean')
+        print("Using Focal Loss with gamma=2.0")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        print("Using Weighted CrossEntropyLoss")
+    
+    # Optimizer with weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Learning rate scheduler - using OneCycleLR for faster convergence
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=lr * 10,  # Higher peak learning rate
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        anneal_strategy='cos',
+        div_factor=10.0,  # Initial LR = max_lr/div_factor
+        final_div_factor=100.0  # Final LR = initial_lr/final_div_factor
+    )
+
+    # Initialize mixed precision training
+    scaler = GradScaler() if use_amp else None
+    
+    # Training metrics tracking
+    epochs_list = []
+    train_losses = []
+    val_losses = []
+    val_accuracies = []
+    per_class_f1_scores = []
+    best_f1_score = 0.0
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        epoch_start_time = time.time()
+        data_time = 0
+        compute_time = 0
+        batch_start_time = time.time()
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
+        for pre_batch, post_batch, labels in train_pbar:
+            # Measure data loading time
+            data_time += time.time() - batch_start_time
+            
+            # Transfer to device
+            pre_batch = pre_batch.to(device, non_blocking=True)
+            post_batch = post_batch.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            # Apply mixup if enabled
+            mixup_applied = False
+            if use_mixup and np.random.random() < 0.5:
+                pre_batch, post_batch, labels_a, labels_b, lam = mixup_data(pre_batch, post_batch, labels, alpha=0.2, device=device)
+                mixup_applied = True
+
+            # Zero gradients
+            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+            
+            # Forward pass with mixed precision
+            if use_amp:
+                with autocast():
+                    outputs = model(pre_batch, post_batch)
+                    if mixup_applied:
+                        loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                    else:
+                        loss = criterion(outputs, labels)
+                
+                # Backward pass with scaling
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard precision training
+                outputs = model(pre_batch, post_batch)
+                if mixup_applied:
+                    loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                else:
+                    loss = criterion(outputs, labels)
+                    
+                loss.backward()
+                optimizer.step()
+                
+            # Step the scheduler
+            scheduler.step()
+            
+            # Update metrics
+            running_loss += loss.item()
+            compute_time += time.time() - batch_start_time - data_time
+            
+            # Update progress bar
+            current_lr = scheduler.get_last_lr()[0]
+            train_pbar.set_postfix({
+                "loss": f"{loss.item():.4f}", 
+                "lr": f"{current_lr:.6f}",
+                "data_time": f"{data_time/train_pbar.n:.3f}s/it",
+                "compute_time": f"{compute_time/train_pbar.n:.3f}s/it"
+            })
+            
+            # Reset timing
+            batch_start_time = time.time()
+            
+        # Compute average loss
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Print timing statistics
+        print(f"Epoch {epoch+1} training - Data time: {data_time:.2f}s, Compute time: {compute_time:.2f}s")
+        
+        # Validation phase
+        model.eval()
+        val_loss_epoch = 0.0
+        correct = 0
+        total = 0
+        all_preds = []
+        all_labels = []
+        val_start_time = time.time()
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [VAL]", leave=True)
+            for pre_batch, post_batch, labels in val_pbar:
+                pre_batch = pre_batch.to(device, non_blocking=True)
+                post_batch = post_batch.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                # Mixed precision inference (faster but not critical for validation)
+                if use_amp:
+                    with autocast():
+                        outputs = model(pre_batch, post_batch)
+                        loss = criterion(outputs, labels)
+                else:
+                    outputs = model(pre_batch, post_batch)
+                    loss = criterion(outputs, labels)
+                    
+                val_loss_epoch += loss.item()
+                
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+                val_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                
+        val_time = time.time() - val_start_time
+        val_loss_epoch /= len(val_loader)
+        val_losses.append(val_loss_epoch)
+        val_acc = 100 * correct / total if total > 0 else 0
+        val_accuracies.append(val_acc)
+        
+        # Calculate F1 scores
+        epoch_f1 = f1_score(all_labels, all_preds, average=None, labels=[0, 1, 2, 3])
+        per_class_f1_scores.append(epoch_f1)
+        
+        # Calculate macro F1 for model saving
+        macro_f1 = np.mean(epoch_f1)
+        epochs_list.append(epoch + 1)
+        
+        # Calculate elapsed time
+        epoch_time = time.time() - epoch_start_time
+        
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {val_loss_epoch:.4f} | "
+              f"Val Acc: {val_acc:.2f}% | "
+              f"Macro F1: {macro_f1:.4f} | "
+              f"Time: {epoch_time:.1f}s (Val: {val_time:.1f}s)")
+        
+        print(f"Per-class F1 Scores: {', '.join([f'{c}: {f:.4f}' for c, f in zip(DAMAGE_LABELS.keys(), epoch_f1)])}")
+        
+        # Save the model if it's the best so far
+        if macro_f1 > best_f1_score:
+            best_f1_score = macro_f1
+            best_model_path = os.path.join(model_dir, f"best_model_epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved with Macro F1: {best_f1_score:.4f}")
+        
+        # Early stopping check (optional)
+        # if epoch > 2 and val_losses[-1] > val_losses[-2] and val_losses[-2] > val_losses[-3]:
+        #     print("Early stopping triggered - validation loss increasing for 3 epochs")
+        #     break
+
+    # Save the final model regardless
+    final_save_path = os.path.join(project_root, "baseline_model_final.pt")
+    torch.save(model.state_dict(), final_save_path)
+    print(f"Final model saved to {final_save_path}")
+    
+    # Create learning curves plot
+    plot_save_path = os.path.join(pictures_dir, "learning_curves.png")
+    plot_learning_curves(
+        epochs_list, 
+        train_losses, 
+        val_losses, 
+        val_accuracies, 
+        per_class_f1_scores,
+        list(DAMAGE_LABELS.keys()),
+        plot_save_path
+    )
+    
+    # Save all training metrics
+    metrics = {
+        "epochs": epochs_list,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_accuracies": val_accuracies,
+        "per_class_f1_scores": per_class_f1_scores,
+    }
+    
+    metrics_path = os.path.join(output_dir, "training_metrics.txt")
+    with open(metrics_path, "w") as f:
+        for key, values in metrics.items():
+            if key == "per_class_f1_scores":
+                f.write(f"{key}:\n")
+                for epoch_idx, epoch_scores in enumerate(values):
+                    f.write(f"  Epoch {epoch_idx+1}: {epoch_scores}\n")
+            else:
+                f.write(f"{key}: {values}\n")
+    
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time/60:.2f} minutes")
+    print(f"Best validation Macro F1: {best_f1_score:.4f}")
+    print(f"All training artifacts saved to {output_dir}")
+    print("Run 'evaluate_baseline.py' to test the model")
+
+if __name__ == "__main__":
+    main()
+
+
+data_loader:
+import os
+import json
+import math
+import torch
+import random
+from torch.utils.data import Dataset
+from PIL import Image
+import torchvision.transforms as T
+from shapely import wkt
+
+# Maps the xBD "subtype" to an integer label
+DAMAGE_LABELS = {
+    "no-damage": 0,
+    "minor-damage": 1,
+    "major-damage": 2,
+    "destroyed": 3
+    # If there's "unclassified", you can decide to skip or map it to 0
+}
+
+class XBDPatchDataset(Dataset):
+    """
+    On-the-fly dataset that:
+      - Scans all disasters under data/xBD
+      - For each post-disaster JSON, enumerates building polygons
+      - Computes bounding boxes, then center-crops the pre & post images
+      - Returns (pre_patch, post_patch, label)
+    """
+    def __init__(self,
+                 root_dir,
+                 pre_crop_size=128,
+                 post_crop_size=224,
+                 use_xy=True,
+                 max_samples=None,
+                 flat_structure=False,
+                 augment=True):
+        """
+        :param root_dir: Path to "data/xBD" (containing subfolders for each disaster)
+        :param pre_crop_size: Patch size for pre-disaster images (shallow CNN)
+        :param post_crop_size: Patch size for post-disaster images (ResNet50)
+        :param use_xy: If True, use 'xy' coords from JSON; else use 'lng_lat'
+        :param max_samples: If not None, limit total building samples to this number
+        :param flat_structure: If True, assumes images are in a flat directory structure
+        :param augment: If True, apply data augmentation
+        """
+        super().__init__()
+        self.root_dir = root_dir
+        self.pre_crop_size = pre_crop_size
+        self.post_crop_size = post_crop_size
+        self.coord_key = "xy" if use_xy else "lng_lat"
+        self.max_samples = max_samples
+        self.flat_structure = flat_structure
+        self.augment = augment
+        
+        # Check if we're using '/test' directory structure which has images and labels subdirs
+        if os.path.basename(os.path.normpath(root_dir)) == 'test' and os.path.isdir(os.path.join(root_dir, 'images')) and os.path.isdir(os.path.join(root_dir, 'labels')):
+            self.test_structure = True
+        else:
+            self.test_structure = False
+
+        # We'll define transforms for each branch
+        if augment:
+            self.pre_transform = T.Compose([
+                T.Resize((pre_crop_size, pre_crop_size)),
+                T.RandomHorizontalFlip(),
+                T.RandomVerticalFlip(),
+                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+            ])
+            self.post_transform = T.Compose([
+                T.Resize((post_crop_size, post_crop_size)),
+                T.RandomHorizontalFlip(),
+                T.RandomVerticalFlip(),
+                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.pre_transform = T.Compose([
+                T.Resize((pre_crop_size, pre_crop_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+            ])
+            self.post_transform = T.Compose([
+                T.Resize((post_crop_size, post_crop_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+            ])
+
+        # Collect a list of all building samples (pre_path, post_path, bounding_box, label)
+        self.samples = self._gather_samples()
+
+        # If user wants to limit the number of samples
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = random.sample(self.samples, self.max_samples)
+
+    def _gather_samples(self):
+        """
+        Iterates over each disaster folder, each *_post_disaster.json,
+        enumerates polygons, and collects:
+          - pre_image_path
+          - post_image_path
+          - bounding box (x1, y1, x2, y2)
+          - label (0..3)
+        Returns a list of dicts, one per building.
+        """
+        samples = []
+        
+        if self.flat_structure:
+            # Flat structure: images directly in root_dir
+            # For flat structure, we pair pre and post images directly
+            files = os.listdir(self.root_dir)
+            pre_images = [f for f in files if f.endswith("_pre_disaster.png")]
+            
+            for pre_image_name in pre_images:
+                base_id = pre_image_name.replace("_pre_disaster.png", "")
+                post_image_name = base_id + "_post_disaster.png"
+                
+                # Ensure post-disaster image exists
+                if post_image_name not in files:
+                    continue
+                
+                pre_image_path = os.path.join(self.root_dir, pre_image_name)
+                post_image_path = os.path.join(self.root_dir, post_image_name)
+                
+                # In flat structure mode, we take the whole image and use a default label
+                # This assumes you're using the dataset for pre/post comparison without labels
+                try:
+                    with Image.open(pre_image_path) as img:
+                        width, height = img.size
+                    
+                    # Use the entire image as the bbox
+                    samples.append({
+                        "pre_img": pre_image_path,
+                        "post_img": post_image_path,
+                        "bbox": (0, 0, width, height),
+                        "label": 0  # Default label, can be modified if needed
+                    })
+                except Exception as e:
+                    print(f"Error processing {pre_image_path}: {e}")
+                    continue
+        elif self.test_structure:
+            # Test structure: has 'images' and 'labels' subdirectories
+            images_dir = os.path.join(self.root_dir, "images")
+            labels_dir = os.path.join(self.root_dir, "labels")
+            
+            # Get all image files
+            image_files = [f for f in os.listdir(images_dir) if f.endswith(".png")]
+            pre_images = [f for f in image_files if f.endswith("_pre_disaster.png")]
+            
+            for pre_image_name in pre_images:
+                base_id = pre_image_name.replace("_pre_disaster.png", "")
+                post_image_name = base_id + "_post_disaster.png"
+                pre_json_name = base_id + "_pre_disaster.json"
+                post_json_name = base_id + "_post_disaster.json"
+                
+                # Ensure post-disaster image exists
+                if post_image_name not in image_files:
+                    continue
+                
+                pre_image_path = os.path.join(images_dir, pre_image_name)
+                post_image_path = os.path.join(images_dir, post_image_name)
+                post_json_path = os.path.join(labels_dir, post_json_name)
+                pre_json_path = os.path.join(labels_dir, pre_json_name)
+                
+                # Check if all files exist
+                if not os.path.isfile(post_json_path) or not os.path.isfile(pre_json_path):
+                    continue
+                
+                # Load JSON
+                try:
+                    with open(post_json_path, 'r') as f:
+                        post_data = json.load(f)
+                    
+                    # Parse features
+                    feats = post_data.get("features", {}).get(self.coord_key, [])
+                    
+                    # If no features, use the entire image with a default label
+                    if not feats:
+                        with Image.open(pre_image_path) as img:
+                            width, height = img.size
+                        
+                        samples.append({
+                            "pre_img": pre_image_path,
+                            "post_img": post_image_path,
+                            "bbox": (0, 0, width, height),
+                            "label": 0  # Default label
+                        })
+                        continue
+                    
+                    for feat in feats:
+                        damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                        if damage_type not in DAMAGE_LABELS:
+                            # Skip if "unclassified" or unknown
+                            continue
+                        label = DAMAGE_LABELS[damage_type]
+                        
+                        # Parse polygon
+                        wkt_str = feat.get("wkt", None)
+                        if wkt_str is None:
+                            continue
+                        polygon = wkt.loads(wkt_str)
+                        # Compute bounding box (minx, miny, maxx, maxy)
+                        minx, miny, maxx, maxy = polygon.bounds
+                        
+                        # Store sample
+                        samples.append({
+                            "pre_img": pre_image_path,
+                            "post_img": post_image_path,
+                            "bbox": (minx, miny, maxx, maxy),
+                            "label": label
+                        })
+                
+                except Exception as e:
+                    print(f"Error processing {post_json_path}: {e}")
+                    continue
+        else:
+            # Regular structure: disaster subfolders with images and labels
+            disasters = [
+                d for d in os.listdir(self.root_dir)
+                if os.path.isdir(os.path.join(self.root_dir, d))
+                   and d.lower() != "spacenet_gt"
+            ]
+
+            for disaster in disasters:
+                disaster_dir = os.path.join(self.root_dir, disaster)
+                images_dir = os.path.join(disaster_dir, "images")
+                labels_dir = os.path.join(disaster_dir, "labels")
+
+                # skip if no images/labels folder
+                if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                    continue
+
+                # get all post-disaster JSON files
+                label_files = [
+                    f for f in os.listdir(labels_dir)
+                    if f.endswith("_post_disaster.json")
+                ]
+                for label_file in label_files:
+                    base_id = label_file.replace("_post_disaster.json", "")
+                    post_image_name = base_id + "_post_disaster.png"
+                    pre_image_name  = base_id + "_pre_disaster.png"
+
+                    post_json_path = os.path.join(labels_dir, label_file)
+                    post_image_path = os.path.join(images_dir, post_image_name)
+                    pre_json_path  = os.path.join(labels_dir, base_id + "_pre_disaster.json")
+                    pre_image_path = os.path.join(images_dir, pre_image_name)
+
+                    # ensure all required files exist
+                    if not os.path.isfile(post_json_path) or \
+                       not os.path.isfile(post_image_path) or \
+                       not os.path.isfile(pre_json_path) or \
+                       not os.path.isfile(pre_image_path):
+                        continue
+
+                    # load JSON
+                    with open(post_json_path, 'r') as f:
+                        post_data = json.load(f)
+                    # parse features
+                    feats = post_data.get("features", {}).get(self.coord_key, [])
+                    
+                    for feat in feats:
+                        damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                        if damage_type not in DAMAGE_LABELS:
+                            # skip if "unclassified" or unknown
+                            continue
+                        label = DAMAGE_LABELS[damage_type]
+
+                        # parse polygon
+                        wkt_str = feat.get("wkt", None)
+                        if wkt_str is None:
+                            continue
+                        polygon = wkt.loads(wkt_str)
+                        # compute bounding box (minx, miny, maxx, maxy)
+                        minx, miny, maxx, maxy = polygon.bounds
+
+                        # store sample
+                        samples.append({
+                            "pre_img": pre_image_path,
+                            "post_img": post_image_path,
+                            "bbox": (minx, miny, maxx, maxy),
+                            "label": label
+                        })
+
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        pre_path = item["pre_img"]
+        post_path = item["post_img"]
+        (minx, miny, maxx, maxy) = item["bbox"]
+        label = item["label"]
+
+        # open images
+        pre_img = Image.open(pre_path).convert("RGB")
+        post_img = Image.open(post_path).convert("RGB")
+
+        # center-based crop for each
+        pre_crop = self._center_crop(pre_img, minx, miny, maxx, maxy, self.pre_crop_size)
+        post_crop = self._center_crop(post_img, minx, miny, maxx, maxy, self.post_crop_size)
+
+        # apply transforms
+        pre_tensor = self.pre_transform(pre_crop)
+        post_tensor = self.post_transform(post_crop)
+
+        return pre_tensor, post_tensor, label
+
+    def _center_crop(self, pil_img, minx, miny, maxx, maxy, crop_size):
+        """
+        Takes the bounding box, finds center, does a square crop of size (crop_size x crop_size).
+        If it goes out of bounds, we clamp to the image edge.
+        """
+        width, height = pil_img.size  # (W, H)
+
+        bb_width = maxx - minx
+        bb_height = maxy - miny
+
+        # bounding box center
+        cx = minx + bb_width / 2.0
+        cy = miny + bb_height / 2.0
+
+        # We want a crop_size x crop_size region around (cx, cy)
+        # top-left corner:
+        half = crop_size / 2.0
+        left = cx - half
+        top = cy - half
+        right = left + crop_size
+        bottom = top + crop_size
+
+        # clamp to image bounds
+        left   = max(0, min(left, width - crop_size))
+        top    = max(0, min(top, height - crop_size))
+        right  = left + crop_size
+        bottom = top + crop_size
+
+        # Crop
+        return pil_img.crop((left, top, right, bottom))
+
+if __name__ == "__main__":
+    dataset = XBDPatchDataset(root_dir="/home/pablos/Documents/uc3m/DammageAs/data/xBD")
+    print(f"Total samples: {len(dataset)}")
+    # Optionally, fetch one sample and print its shape
+    pre_img, post_img, label = dataset[0]
+    print(pre_img.shape, post_img.shape, label)
+
+
+
+baseline_model:
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torchvision.models import ResNet50_Weights
+
+class ShallowCNN(nn.Module):
+    """
+    A shallow CNN branch (Figure 10, left side) for the pre-disaster image.
+    We'll assume input size is (3 x 128 x 128). If your input size differs,
+    adjust layers accordingly.
+    """
+    def __init__(self):
+        super().__init__()
+        
+        # 4 blocks: each has a 5x5 conv (with padding=2), ReLU, 2x2 max pool.
+        # Channel progression: 3 -> 16 -> 32 -> 64 -> 128
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(32, 64, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(64, 128, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+        
+        # After 4 pooling ops, 128x128 -> 8x8 => shape (batch, 128, 8, 8) => 8192 features.
+        # Then a linear layer to reduce to 512 dims.
+        self.fc = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 512),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        """
+        x shape expected: (batch_size, 3, 128, 128)
+        """
+        x = self.features(x)              # => (batch, 128, 8, 8)
+        x = x.view(x.size(0), -1)         # Flatten => (batch, 8192)
+        x = self.fc(x)                    # => (batch, 512)
+        return x
+
+
+class BaselineModel(nn.Module):
+    """
+    Two-branch model from the xBD paper (Figure 10):
+    - Branch 1: Pretrained ResNet50 (for post-disaster image).
+    - Branch 2: Shallow CNN (for pre-disaster image).
+    - Concat the features, then pass through dense layers for classification.
+    """
+    def __init__(self, num_classes=4):
+        super().__init__()
+
+        # 1) Load ResNet50 with IMAGENET1K_V2 weights
+        #    This sets up the official improved training recipe weights
+        self.resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        
+        # Remove ResNet's final fc layer, to get a 2048-d feature vector
+        self.resnet.fc = nn.Identity()
+
+        # 2) Shallow CNN branch
+        self.shallow_cnn = ShallowCNN()  # outputs 512-d features
+
+        # 3) Final classifier
+        #    After concatenation, we have 2048 (from ResNet) + 512 (from ShallowCNN) = 2560
+        #    Then we apply Dense(224) -> Dense(224) -> Output(num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(2048 + 512, 224),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            
+            nn.Linear(224, 224),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            
+            nn.Linear(224, num_classes)
+        )
+
+    def forward(self, pre_img, post_img):
+        """
+        pre_img : (batch_size, 3, 128, 128)   => Shallow CNN
+        post_img: (batch_size, 3, 224, 224)  => ResNet50
+
+        Return: (batch_size, num_classes)
+        """
+        # Post-disaster image through ResNet50
+        post_feats = self.resnet(post_img)   # => (batch, 2048)
+
+        # Pre-disaster image through Shallow CNN
+        pre_feats = self.shallow_cnn(pre_img)  # => (batch, 512)
+
+        # Concatenate features
+        combined = torch.cat([post_feats, pre_feats], dim=1)  # => (batch, 2560)
+
+        # Classify
+        out = self.classifier(combined)  # => (batch, num_classes)
+        return out
+
+
+if __name__ == "__main__":
+    # Quick shape test
+    model = BaselineModel(num_classes=4)
+    print(model)
+
+    # Create dummy data
+    pre_img_dummy = torch.randn(2, 3, 128, 128)
+    post_img_dummy = torch.randn(2, 3, 224, 224)
+
+    outputs = model(pre_img_dummy, post_img_dummy)
+    print("Output shape:", outputs.shape)  # Expected: [2, 4]
+
+
+
+evaluate_baseline:
+import os
+import sys
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             f1_score, precision_score, recall_score,
+                             cohen_kappa_score, balanced_accuracy_score,
+                             accuracy_score, roc_auc_score, roc_curve, auc)
+import time
+from datetime import datetime
+
+# Add project root to sys.path so we can import our modules
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.append(project_root)
+
+from overlaying_labels.models.baseline_model import BaselineModel
+from options.utils.data_loader import XBDPatchDataset, DAMAGE_LABELS
+
+def seed_everything(seed=42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to {seed}")
+
+def evaluate_model(model, dataloader, device, use_tta=False):
+    """Evaluate model with optional test-time augmentation."""
+    model.eval()
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []  # For ROC curves
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Evaluating", leave=True)
+        for pre_imgs, post_imgs, labels in pbar:
+            pre_imgs = pre_imgs.to(device)
+            post_imgs = post_imgs.to(device)
+            labels = labels.to(device)
+            
+            # Either use test-time augmentation or standard forward pass
+            if use_tta:
+                outputs = test_time_augmentation(model, pre_imgs, post_imgs, device)
+            else:
+                outputs = model(pre_imgs, post_imgs)
+            
+            # Get predictions and probabilities
+            probabilities = F.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+            
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probabilities.cpu().numpy())
+            
+            # Update progress bar
+            pbar.set_postfix({"Acc": f"{100 * correct / total:.2f}%"})
+    
+    accuracy = 100 * correct / total if total > 0 else 0
+    return accuracy, np.array(all_preds), np.array(all_labels), np.array(all_probs)
+
+def test_time_augmentation(model, pre_img, post_img, device, num_augments=5):
+    """Apply test-time augmentation by running multiple forward passes with different augmentations."""
+    model.eval()
+    batch_size = pre_img.size(0)
+    
+    # Initialize with original predictions
+    with torch.no_grad():
+        outputs_original = model(pre_img, post_img)
+    
+    all_outputs = [outputs_original]
+    
+    # Horizontal flip augmentation
+    with torch.no_grad():
+        pre_hflip = torch.flip(pre_img, dims=[3])
+        post_hflip = torch.flip(post_img, dims=[3])
+        outputs_hflip = model(pre_hflip, post_hflip)
+        all_outputs.append(outputs_hflip)
+    
+    # Vertical flip augmentation
+    with torch.no_grad():
+        pre_vflip = torch.flip(pre_img, dims=[2])
+        post_vflip = torch.flip(post_img, dims=[2])
+        outputs_vflip = model(pre_vflip, post_vflip)
+        all_outputs.append(outputs_vflip)
+    
+    # Both horizontal and vertical flip
+    with torch.no_grad():
+        pre_hvflip = torch.flip(pre_img, dims=[2, 3])
+        post_hvflip = torch.flip(post_img, dims=[2, 3])
+        outputs_hvflip = model(pre_hvflip, post_hvflip)
+        all_outputs.append(outputs_hvflip)
+    
+    # Center crop augmentation (90% of image)
+    if num_augments > 4:
+        with torch.no_grad():
+            h, w = pre_img.shape[2:]
+            ch, cw = int(h * 0.1), int(w * 0.1)
+            pre_crop = pre_img[:, :, ch:h-ch, cw:w-cw]
+            post_crop = post_img[:, :, ch:h-ch, cw:w-cw]
+            pre_crop = F.interpolate(pre_crop, size=(h, w), mode='bilinear', align_corners=False)
+            post_crop = F.interpolate(post_crop, size=(h, w), mode='bilinear', align_corners=False)
+            outputs_crop = model(pre_crop, post_crop)
+            all_outputs.append(outputs_crop)
+    
+    # Average the predictions
+    outputs = torch.stack(all_outputs).mean(dim=0)
+    return outputs
+
+def plot_confusion_matrix(cm, target_names, save_path, normalize=False, title=None):
+    """
+    Generate and save a confusion matrix plot.
+    
+    Parameters:
+    - cm: Confusion matrix from sklearn
+    - target_names: List of class names
+    - save_path: Path to save the plot
+    - normalize: Boolean, whether to normalize values
+    - title: Title for the plot
+    """
+    if normalize:
+        cm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
+        fmt = '.2f'
+    else:
+        fmt = 'd'
+    
+    plt.figure(figsize=(10, 8))
+    sns.set(font_scale=1.2)
+    sns.heatmap(cm, annot=True, fmt=fmt, cmap="Blues",
+                xticklabels=target_names, yticklabels=target_names)
+    
+    plt.ylabel('True Label', fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=14)
+    
+    if title:
+        plt.title(title, fontsize=16)
+    else:
+        plt.title("Confusion Matrix", fontsize=16)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+def main():
+    # Set random seed for reproducibility
+    seed_everything(42)
+    
+    # Configuration
+    use_tta = True  # Use test-time augmentation
+    training_try_folder = "trainingTry1"  # Change this to the desired training try folder
+    model_name = "baseline_best.pt"
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Create timestamp for saving results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Test data is stored in a hierarchical structure under data/test
+    test_data_dir = os.path.join(project_root, "data", "test")
+    print(f"Loading evaluation data from: {test_data_dir}")
+
+    # Create test dataset without augmentation
+    test_dataset = XBDPatchDataset(
+        root_dir=test_data_dir,
+        pre_crop_size=128,
+        post_crop_size=224,
+        use_xy=True,
+        max_samples=None,  # Limit samples to 1000 for faster evaluation
+        flat_structure=False,  # Test data is hierarchical
+        augment=False         # No augmentation during evaluation
+    )
+    print(f"Total evaluation samples: {len(test_dataset)}")
+
+    # Create test dataloader with optimizations
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=32,  # Increased batch size for faster evaluation
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # Initialize model
+    model = BaselineModel(num_classes=4).to(device)
+    
+    # Load checkpoint
+    checkpoint_path = os.path.join(project_root, "output", training_try_folder, "models", model_name)
+    if os.path.isfile(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded model weights from {checkpoint_path}")
+    else:
+        print(f"Model checkpoint not found at {checkpoint_path}")
+        return
+
+    # Evaluate model
+    print(f"Starting evaluation{' with test-time augmentation' if use_tta else ''}...")
+    start_time = time.time()
+    accuracy, preds, labels, probs = evaluate_model(model, test_loader, device, use_tta=use_tta)
+    eval_time = time.time() - start_time
+    
+    print(f"\nEvaluation completed in {eval_time:.2f} seconds")
+    print(f"Final Evaluation Accuracy: {accuracy:.2f}%\n")
+
+    # Compute detailed metrics
+    target_names = list(DAMAGE_LABELS.keys())
+    
+    # Check if there are any predictions
+    if len(labels) == 0:
+        print("No samples were evaluated. Exiting...")
+        return
+
+    # Create confusion matrix
+    conf_matrix = confusion_matrix(labels, preds)
+    print("Confusion Matrix:")
+    print(conf_matrix)
+
+    # Create classification report with proper handling of empty arrays
+    if len(labels) > 0 and len(np.unique(labels)) > 0:
+        report = classification_report(labels, preds, target_names=target_names, digits=4)
+        print("\nClassification Report:")
+        print(report)
+
+        # Calculate additional metrics
+        macro_f1 = f1_score(labels, preds, average='macro')
+        weighted_f1 = f1_score(labels, preds, average='weighted')
+        macro_precision = precision_score(labels, preds, average='macro')
+        weighted_precision = precision_score(labels, preds, average='weighted')
+        macro_recall = recall_score(labels, preds, average='macro')
+        weighted_recall = recall_score(labels, preds, average='weighted')
+        kappa = cohen_kappa_score(labels, preds)
+        bal_accuracy = balanced_accuracy_score(labels, preds)
+    else:
+        print("No valid labels or predictions to calculate metrics.")
+        macro_f1 = weighted_f1 = macro_precision = weighted_precision = macro_recall = weighted_recall = kappa = bal_accuracy = 0.0
+
+    print("Additional Metrics:")
+    print(f"Macro F1 Score: {macro_f1:.4f}")
+    print(f"Weighted F1 Score: {weighted_f1:.4f}")
+    print(f"Macro Precision: {macro_precision:.4f}")
+    print(f"Weighted Precision: {weighted_precision:.4f}")
+    print(f"Macro Recall: {macro_recall:.4f}")
+    print(f"Weighted Recall: {weighted_recall:.4f}")
+    print(f"Cohen's Kappa: {kappa:.4f}")
+    print(f"Balanced Accuracy: {bal_accuracy:.4f}")
+
+    # Determine the next evaluation try number
+    results_dir = os.path.join(project_root, "evaluation_results")
+    os.makedirs(results_dir, exist_ok=True)
+    try_number = 1
+    while os.path.exists(os.path.join(results_dir, f"evaluationTry{try_number}")):
+        try_number += 1
+
+    # Create directory for this evaluation try
+    try_dir = os.path.join(results_dir, f"evaluationTry{try_number}")
+    os.makedirs(try_dir, exist_ok=True)
+
+    # Save detailed results to a text file
+    results_path = os.path.join(try_dir, f"evaluation_results_try{try_number}.txt")
+    with open(results_path, 'w') as f:
+        f.write(f"Evaluation Results for {model_name}\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Test-Time Augmentation: {use_tta}\n\n")
+        
+        if len(labels) > 0:
+            f.write("Confusion Matrix:\n")
+            f.write(str(conf_matrix) + "\n\n")
+            
+            if len(np.unique(labels)) > 0:
+                f.write("Classification Report:\n")
+                f.write(report + "\n\n")
+        else:
+            f.write("No samples were evaluated.\n\n")
+        
+        f.write("Additional Metrics:\n")
+        f.write(f"Accuracy: {accuracy:.4f}%\n")
+        f.write(f"Macro F1 Score: {macro_f1:.4f}\n")
+        f.write(f"Weighted F1 Score: {weighted_f1:.4f}\n")
+        f.write(f"Macro Precision: {macro_precision:.4f}\n")
+        f.write(f"Weighted Precision: {weighted_precision:.4f}\n")
+        f.write(f"Macro Recall: {macro_recall:.4f}\n")
+        f.write(f"Weighted Recall: {weighted_recall:.4f}\n")
+        f.write(f"Cohen's Kappa: {kappa:.4f}\n")
+        f.write(f"Balanced Accuracy: {bal_accuracy:.4f}\n")
+    
+    print(f"Detailed evaluation results saved to {results_path}")
+
+    # Save visualizations to the try directory
+    print(f"Saving visualizations to {try_dir}")
+
+    # Skip plotting if no samples were evaluated
+    if len(labels) == 0 or len(np.unique(labels)) == 0:
+        print("No samples or unique labels to generate visualizations.")
+        return
+
+    # Plot and save confusion matrix
+    cm_save_path = os.path.join(try_dir, "confusion_matrix.png")
+    plot_confusion_matrix(conf_matrix, target_names, cm_save_path, 
+                         title=f"Confusion Matrix (Accuracy: {accuracy:.2f}%)")
+    
+    cm_norm_save_path = os.path.join(try_dir, "confusion_matrix_normalized.png")
+    plot_confusion_matrix(conf_matrix, target_names, cm_norm_save_path, normalize=True,
+                         title="Normalized Confusion Matrix")
+
+    # Plot per-class metrics
+    try:
+        per_class_f1 = f1_score(labels, preds, average=None, labels=range(len(target_names)))
+        per_class_precision = precision_score(labels, preds, average=None, labels=range(len(target_names)))
+        per_class_recall = recall_score(labels, preds, average=None, labels=range(len(target_names)))
+        
+        f1_save_path = os.path.join(try_dir, "per_class_f1.png")
+        plot_per_class_metrics(per_class_f1, "F1 Score", target_names, f1_save_path)
+        
+        precision_save_path = os.path.join(try_dir, "per_class_precision.png")
+        plot_per_class_metrics(per_class_precision, "Precision", target_names, precision_save_path)
+        
+        recall_save_path = os.path.join(try_dir, "per_class_recall.png")
+        plot_per_class_metrics(per_class_recall, "Recall", target_names, recall_save_path)
+        
+        # Plot ROC curves for multi-class classification
+        roc_save_path = os.path.join(try_dir, "roc_curves.png")
+        plot_roc_curves(probs, labels, target_names, roc_save_path)
+        
+        # Analyze errors
+        error_save_path = os.path.join(try_dir, "error_analysis.png")
+        analyze_errors(preds, labels, probs, target_names, error_save_path)
+    except Exception as e:
+        print(f"Error generating metric plots: {e}")
+    
+    # Randomly sample predictions to show variety if we have predictions
+    if len(preds) > 0:
+        num_samples = min(15, len(preds))
+        sample_indices = random.sample(range(len(preds)), num_samples)
+        
+        print("\nSample Predictions (randomly selected):")
+        print(f"{'Index':<8} {'True Label':<15} {'Predicted':<15} {'Confidence':<10} {'Correct':<8}")
+        print("-" * 60)
+        
+        for i in sample_indices:
+            pred_class = target_names[preds[i]]
+            true_class = target_names[labels[i]]
+            confidence = probs[i, preds[i]]
+            correct = "✓" if preds[i] == labels[i] else "✗"
+            print(f"{i:<8} {true_class:<15} {pred_class:<15} {confidence:.4f}      {correct}")
+
+if __name__ == "__main__":
+    main()

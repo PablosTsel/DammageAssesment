@@ -1,0 +1,259 @@
+Understanding the Building Damage Assessment Project
+This project builds an AI system that looks at satellite images of buildings before and after disasters, then tells us how badly each building was damaged. Let me walk you through how it works step-by-step.
+Overall Goal
+The system classifies each building into one of four categories:
+
+No damage (0)
+Minor damage (1)
+Major damage (2)
+Destroyed (3)
+
+Data Organization
+The data is stored in a specific folder structure:
+
+data/xBD: Contains the main training data organized by disaster type
+data/test: Contains separate test data for evaluation
+data/hold: Contains unseen data from the challenge
+
+Inside each disaster folder (like "guatemala-volcano"), there are:
+
+images folder: Contains satellite images (both pre-disaster and post-disaster)
+labels folder: Contains JSON files with building outlines and damage labels
+
+Dataset Details (xBD)
+The xBD dataset has satellite images from 19 different disasters worldwide. For each area, there are:
+
+Pre-disaster satellite images
+Post-disaster satellite images (same location)
+Building polygon outlines
+Damage category labels for each building
+
+The data has class imbalance - meaning there are many more undamaged buildings than damaged ones.
+Data Preprocessing Steps
+Here's what happens to prepare the data:
+
+Finding building locations: The system reads the JSON files that contain building outlines in a format called WKT (Well-Known Text).
+Cropping building patches: For each building, it:
+
+Calculates a bounding box around the building
+Adds a small buffer (2 pixels) to include surrounding context
+Crops that area from both pre-disaster and post-disaster images
+
+
+Resizing and normalization:
+
+Pre-disaster images are resized to 128×128 pixels
+Post-disaster images are resized to 224×224 pixels
+All images are normalized using ImageNet statistics (making pixel values more consistent)
+
+
+Handling class imbalance:
+
+The system uses weighted sampling during training
+This gives higher importance to less common damage classes
+The weight scale is set to 0.7 (balances but doesn't completely equalize classes)
+
+
+Data splitting:
+
+85% of data used for training
+15% used for validation
+Split is stratified (each split has same proportion of damage classes)
+
+
+
+Model Architecture
+The model has a dual-branch design:
+
+Two separate ResNet50 backbones:
+
+One processes pre-disaster images
+One processes post-disaster images
+Both start with pre-trained weights from ImageNet
+
+
+Attention Fusion Module:
+
+Takes features from both branches
+Computes attention weights to focus on important areas
+Combines pre-disaster and post-disaster features
+
+
+Classification Head:
+
+Global average pooling to reduce spatial dimensions
+Three fully-connected layers (2048→512→256→4)
+Each layer has batch normalization, ReLU activation, and dropout
+Final layer outputs 4 scores (one for each damage class)
+
+
+
+Training Process Step-by-Step
+
+Initialization:
+
+Set random seed (42) for reproducibility
+Create output directories for models and results
+Select device (GPU if available)
+Set hyperparameters (batch size=32, learning rate=0.0001, etc.)
+
+
+Data Loading:
+
+Initialize the XBDPatchDataset
+Create stratified train-validation split (85%-15%)
+Calculate sample weights to address class imbalance
+Create dataloaders with weighted sampling for training
+
+
+Model Setup:
+
+Create BaselineModel instance
+Move model to GPU
+Set up Focal Loss (better for imbalanced classes)
+Initialize AdamW optimizer with weight decay
+Set up OneCycleLR learning rate scheduler
+
+
+Training Loop (20 epochs):
+
+For each epoch:
+
+Set model to training mode
+Loop through batches of data
+Get pre/post image patches and damage labels
+Forward pass through model
+Calculate loss
+Backward pass to compute gradients
+Update weights and learning rate
+Track metrics (loss, accuracy)
+
+
+After training phase:
+
+Set model to evaluation mode
+Validate on validation set
+Calculate validation loss, accuracy, F1 scores
+Save model if it has best F1 score so far
+
+
+
+
+Metric Tracking:
+
+Training loss (decreases from ~9.0 to ~0.009)
+Validation loss
+Validation accuracy (increases to ~87%)
+Per-class F1 scores
+
+
+Model Saving:
+
+Save the best model based on macro F1 score
+Copy best model as "baseline_best.pt"
+Save training metrics and configuration
+
+
+Visualization:
+
+Create learning curves plot
+Show training/validation loss
+Show validation accuracy
+Show per-class F1 scores
+
+
+
+Evaluation Process
+After training, a separate script evaluates the model:
+
+Loading:
+
+Load the best model from training
+Prepare test dataset
+
+
+Test-time augmentation:
+
+Run multiple predictions with different image transformations
+Average the results for more robust predictions
+
+
+Metrics calculation:
+
+Confusion matrix
+Precision, recall, F1 scores (per-class and average)
+ROC curves
+Cohen's Kappa
+Balanced accuracy
+
+
+Error analysis:
+
+Common misclassification patterns
+Confidence distribution for correct vs. incorrect predictions
+
+
+
+Results
+The model achieves:
+
+Overall accuracy: 89.36%
+Macro F1 score: 0.7523
+Class-specific F1 scores:
+
+No-damage: 0.9465 (very good)
+Minor-damage: 0.5236 (challenging)
+Major-damage: 0.7277 (good)
+Destroyed: 0.8114 (very good)
+
+
+
+The model performs best on no-damage and destroyed classes, but struggles more with the intermediate damage classes.
+
+
+
+we want to predict in new images the damages of the building having trained a model that detects 4 different categories of damage. for that,
+first we have to prepare the data to be trained. we first read the labels in wkt format that outlines each polygon so we know where each 
+building is located. we are analyzing post and pre images because it might be helpful afterwards with attention fusion to detect the changes
+between the two. Then we calculate the bounding boxes but giving a buffer of 2 pixels to detect debris etc. then we resize the images but 
+pre 128x128 and post 224x224 because they are more important for dammage detection and they need higher resolution to detect the dammages. 
+Then they are normalized using imagenet. To handle the class imbalance we use weight sampling during training and we gave a scale of 0.7. and then the training process starts. We are using a 
+dual branch design with two separate resnet 50 backbones. then we have an attention fusion module that detects the changes in between the images. if the change is significant the weight will be 
+close to 1. then the classification head receives those weights and precess them through its laer to come up with 4 outputs.
+[0.1, 0.2, 0.7, 0.0] -> highest confidence major damage
+If the prediction is wrong, then we calculate the loss of the difference between our predicted scores and the true labels, 
+backpropagation updates the weights and overtime the classification head learns to interpret the highlighted features correctly. 
+and it repeats this process the number of epochs we have chosen
+
+
+Diferencias con el otro proyecto:
+Utilizo transformer based model (Swin Transformer) con CE focal loss. Yo ResNet50 con focal loss normal
+Hizo su test en dos completamente nuevas catastrofes que igual es una buena idea.
+Unio la clase 1 y 2 para tener en total 3 clases. Estoy pensando que igual es buena idea juntar las clases 0 y 1 pq minor dammage tampoco
+es muy importante para casos de emergencia y enviar ayudas.
+
+
+WKT (Well-Known Text) is a text markup language for representing geometric shapes in geographic information systems. For example, a simple building outline might be represented as 
+POLYGON ((30 10, 40 40, 20 40, 10 20, 30 10)) where each pair of numbers represents x,y coordinates of the polygon's corners, and the last point matches the first to close the shape. 
+In the project code, this WKT string is parsed with polygon = wkt.loads(wkt_str) using the Shapely library, which converts it into a polygon object from which the bounding box coordinates can be extracted 
+with minx, miny, maxx, maxy = polygon.bounds
+
+
+
+ver cuantas imagenes son post de undamaged.
+
+weight sampling mirar otra vez que tengo un peso
+
+stratisfied sampling
+
+no pasarme poco a poco
+
+
+
+Localizacion:
+red: 
+
+
+el test lo hacen tambien con todo el recorte etc
+que tamano tienen originalmente
+analizar toda la base de datos
