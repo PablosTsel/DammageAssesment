@@ -1,0 +1,9 @@
+timestamp: 20250422_104818
+building_detector_path: /home/pablos/Documents/uc3m/DammageAssesment/output/binary_building/binary_building_best.pt
+damage_classifier_path: /home/pablos/Documents/uc3m/DammageAssesment/output/improved_damage/improved_damage_best.pt
+using_improved_model: True
+building_threshold: 0.5
+image_size: 256
+test_samples: 1833
+building_iou: 0.620225520471666
+mean_damage_iou: 0.376476272784599

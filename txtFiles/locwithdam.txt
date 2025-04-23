@@ -1,0 +1,2272 @@
+train_building_detector.py:
+#!/usr/bin/env python3
+# Building Detection Model - Stage 1 of the two-stage approach
+# This script trains a U-Net architecture that only detects building footprints
+# without classifying damage levels
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import jaccard_score
+import random
+from datetime import datetime
+import time
+import torch.nn.functional as F
+import json
+from PIL import Image, ImageDraw
+import torchvision.transforms as T
+from shapely import wkt
+import shutil
+
+# Add the project root to the Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+sys.path.insert(0, project_root)
+
+# Import the UNet architecture and helper functions
+from scripts.training.localization_model import (
+    UNet, seed_everything, create_versioned_directory, 
+    calculate_iou, plot_learning_curves
+)
+
+# Constants
+BUILDING_LABEL = 1
+NON_BUILDING_LABEL = 0
+
+# Dataset class for binary building segmentation
+class XBDBinaryBuildingDataset(Dataset):
+    """
+    Dataset for binary building segmentation that:
+    - Loads pre-disaster satellite images
+    - Converts building polygons from JSON files to binary masks (building vs. non-building)
+    - Returns (image, mask) pairs for training a segmentation model
+    """
+    def __init__(self, 
+                 root_dir,
+                 image_size=256,
+                 use_xy=True,
+                 max_samples=None,
+                 augment=False):
+        """
+        Initialize the binary building segmentation dataset.
+        
+        Args:
+            root_dir: Directory where xBD data is stored
+            image_size: Size of the input/output images (square)
+            use_xy: Use 'xy' coordinates if True; else use 'lng_lat'
+            max_samples: Optional limit on the number of samples
+            augment: If True, applies data augmentation
+        """
+        super().__init__()
+        self.root_dir = root_dir
+        self.image_size = image_size
+        self.coord_key = "xy" if use_xy else "lng_lat"
+        self.max_samples = max_samples
+        self.augment = augment
+        
+        # Transforms for the input images
+        self.image_transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                       std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Gather all samples from the dataset directory
+        self.samples = self._gather_samples()
+        
+        # Limit the number of samples if specified
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = random.sample(self.samples, self.max_samples)
+            
+        print(f"Loaded {len(self.samples)} samples for binary building segmentation")
+    
+    def _gather_samples(self):
+        """
+        Parse the dataset directory to find all valid pre-disaster images with 
+        building footprint annotations.
+        """
+        samples = []
+        
+        # Check for flat structure first
+        images_dir = os.path.join(self.root_dir, "images")
+        labels_dir = os.path.join(self.root_dir, "labels")
+        
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            # Process flat directory structure
+            print(f"Detected flat structure at {self.root_dir}")
+            
+            # Find all pre-disaster JSON files
+            pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+            
+            for pre_label_file in pre_label_files:
+                # Extract base ID from filename
+                base_id = pre_label_file.replace("_pre_disaster.json", "")
+                pre_img_name = base_id + "_pre_disaster.png"
+                
+                pre_json_path = os.path.join(labels_dir, pre_label_file)
+                pre_img_path = os.path.join(images_dir, pre_img_name)
+                
+                # Skip if files don't exist
+                if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                    continue
+                
+                samples.append({
+                    "img_path": pre_img_path,
+                    "pre_json_path": pre_json_path
+                })
+                
+        else:
+            # Process hierarchical directory structure
+            try:
+                # List all disaster directories
+                disasters = [d for d in os.listdir(self.root_dir)
+                           if os.path.isdir(os.path.join(self.root_dir, d))
+                           and d.lower() != "spacenet_gt"]
+                
+                print(f"Found {len(disasters)} disaster folders")
+                
+                # Process each disaster folder
+                for disaster in disasters:
+                    disaster_dir = os.path.join(self.root_dir, disaster)
+                    images_dir = os.path.join(disaster_dir, "images")
+                    labels_dir = os.path.join(disaster_dir, "labels")
+                    
+                    # Skip if directories don't exist
+                    if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                        print(f"Warning: Missing images or labels directory for disaster: {disaster}")
+                        continue
+                    
+                    # Find all pre-disaster JSON files
+                    pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+                    print(f"Disaster {disaster}: Found {len(pre_label_files)} label files")
+                    
+                    # Process each label file
+                    for pre_label_file in pre_label_files:
+                        base_id = pre_label_file.replace("_pre_disaster.json", "")
+                        pre_img_name = base_id + "_pre_disaster.png"
+                        
+                        pre_json_path = os.path.join(labels_dir, pre_label_file)
+                        pre_img_path = os.path.join(images_dir, pre_img_name)
+                        
+                        # Skip if files don't exist
+                        if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                            continue
+                        
+                        samples.append({
+                            "img_path": pre_img_path,
+                            "pre_json_path": pre_json_path,
+                            "disaster": disaster
+                        })
+            except Exception as e:
+                print(f"Error gathering samples: {e}")
+        
+        return samples
+    
+    def __len__(self):
+        """Return the number of samples in the dataset."""
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        """
+        Get a single sample from the dataset.
+        Returns the pre-disaster image and corresponding binary building mask.
+        """
+        item = self.samples[idx]
+        img_path = item["img_path"]
+        pre_json_path = item["pre_json_path"]
+        
+        try:
+            # Load the pre-disaster image
+            img = Image.open(img_path).convert("RGB")
+            original_size = img.size  # (width, height)
+            
+            # Create an empty mask (0 = background/non-building)
+            mask = Image.new("L", original_size, NON_BUILDING_LABEL)
+            draw = ImageDraw.Draw(mask)
+            
+            # Load pre-disaster JSON to get building polygon geometries
+            with open(pre_json_path, 'r') as f:
+                pre_json_data = json.load(f)
+            
+            # Extract building polygons from the pre-disaster JSON
+            pre_feats = pre_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in pre_feats:
+                wkt_str = feat.get("wkt", None)
+                
+                if not wkt_str:
+                    continue
+                
+                # Parse the WKT string to get the polygon
+                polygon = wkt.loads(wkt_str)
+                
+                # Convert polygon to a list of (x, y) tuples for PIL's polygon drawing
+                if hasattr(polygon, 'exterior'):
+                    # For simple polygons with exterior coordinates
+                    coords = list(polygon.exterior.coords)
+                else:
+                    # For multipolygons or other geometries, try to extract coordinates
+                    try:
+                        coords = list(polygon.coords)
+                    except:
+                        # Skip polygons that can't be processed
+                        continue
+                
+                # Draw the polygon filled with the building label
+                draw.polygon(coords, fill=BUILDING_LABEL)
+            
+            # Apply augmentation if enabled
+            if self.augment:
+                # Same random seed for both transforms to apply consistent augmentation
+                seed = np.random.randint(2147483647)
+                random.seed(seed)
+                torch.manual_seed(seed)
+                
+                # Simple rotation/flip augmentation
+                if random.random() > 0.5:
+                    img = T.functional.hflip(img)
+                    mask = T.functional.hflip(mask)
+                if random.random() > 0.5:
+                    img = T.functional.vflip(img)
+                    mask = T.functional.vflip(mask)
+                if random.random() > 0.5:
+                    angle = random.choice([90, 180, 270])
+                    img = T.functional.rotate(img, angle)
+                    mask = T.functional.rotate(mask, angle)
+            
+            # Apply transforms
+            img_tensor = self.image_transform(img)
+            
+            # Resize the mask and convert to tensor
+            mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
+            mask_tensor = torch.from_numpy(np.array(mask)).float().unsqueeze(0)  # Add channel dimension
+            
+            return img_tensor, mask_tensor
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            # Return placeholder tensors in case of error
+            img_tensor = torch.zeros(3, self.image_size, self.image_size)
+            mask_tensor = torch.zeros(1, self.image_size, self.image_size)
+            return img_tensor, mask_tensor
+
+
+def visualize_binary_predictions(model, dataset, device, num_samples=4, save_path=None):
+    """
+    Visualize binary building segmentation predictions.
+    """
+    model.eval()
+    # Select random indices
+    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
+    
+    # Configure the plot
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5 * num_samples))
+    
+    # Track total IoU for binary segmentation
+    total_iou = 0
+    
+    with torch.no_grad():
+        for i, idx in enumerate(indices):
+            # Get sample
+            image, mask = dataset[idx]
+            image = image.unsqueeze(0).to(device)  # Add batch dimension
+            
+            # Get prediction
+            pred = model(image)
+            
+            # Apply sigmoid to get probability map
+            pred = torch.sigmoid(pred)
+            
+            # Create binary prediction (threshold at 0.5)
+            pred_binary = (pred > 0.5).float()
+            
+            # Calculate IoU for this sample
+            pred_flat = pred_binary.view(-1).cpu().numpy()
+            mask_flat = mask.view(-1).cpu().numpy()
+            iou = jaccard_score(mask_flat, pred_flat, average='binary')
+            total_iou += iou
+            
+            # Convert to numpy for visualization
+            pred_binary = pred_binary.squeeze().cpu().numpy()
+            mask = mask.squeeze().cpu().numpy()
+            
+            # Denormalize image for display
+            image = image.squeeze().cpu().numpy()
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            image = np.transpose(image, (1, 2, 0))
+            image = image * std + mean
+            image = np.clip(image, 0, 1)
+            
+            # Plot in the current row
+            axes[i, 0].imshow(image)
+            axes[i, 0].set_title("Pre-disaster Image")
+            axes[i, 0].axis('off')
+            
+            axes[i, 1].imshow(mask, cmap='gray')
+            axes[i, 1].set_title("Ground Truth Buildings")
+            axes[i, 1].axis('off')
+            
+            axes[i, 2].imshow(pred_binary, cmap='gray')
+            axes[i, 2].set_title(f"Predicted Buildings (IoU: {iou:.4f})")
+            axes[i, 2].axis('off')
+    
+    # Calculate average IoU
+    avg_iou = total_iou / num_samples
+    plt.figtext(0.5, 0.01, f"Average IoU: {avg_iou:.4f}", ha="center", 
+                fontsize=14, bbox={"facecolor":"white", "alpha":0.5, "pad":5})
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path)
+        print(f"Binary prediction visualization saved to {save_path}")
+    
+    plt.close()
+    
+    return avg_iou
+
+
+def main():
+    """
+    Main function to run the binary building segmentation training pipeline.
+    """
+    # Set multiprocessing start method to 'spawn' to avoid CUDA initialization errors
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'")
+    except RuntimeError:
+        print("Multiprocessing start method already set to 'spawn' or could not be set")
+        pass
+        
+    start_time = time.time()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    seed_everything(42)
+    
+    # Hyperparameters & settings
+    root_dir = os.path.join(project_root, "data", "xBD")
+    batch_size = 16
+    lr = 0.0002
+    num_epochs = 25
+    val_ratio = 0.2
+    image_size = 256
+    
+    # Create output directory for binary segmentation model
+    output_dir = os.path.join(project_root, "output", "binary_building")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create versioned run directory
+    run_dir, run_num = create_versioned_directory(output_dir, prefix="binary_run")
+    model_dir = os.path.join(run_dir, "models")
+    viz_dir = os.path.join(run_dir, "visualizations")
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    # Save configuration
+    config = {
+        "timestamp": timestamp,
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "num_epochs": num_epochs,
+        "val_ratio": val_ratio,
+        "image_size": image_size
+    }
+    
+    with open(os.path.join(run_dir, f"config_run{run_num}.txt"), "w") as f:
+        for key, value in config.items():
+            f.write(f"{key}: {value}\n")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Initialize dataset
+    print("Initializing XBDBinaryBuildingDataset for training...")
+    full_dataset = XBDBinaryBuildingDataset(
+        root_dir=root_dir,
+        image_size=image_size,
+        use_xy=True,
+        augment=True
+    )
+    
+    # Create train-val split
+    dataset_size = len(full_dataset)
+    indices = list(range(dataset_size))
+    random.shuffle(indices)
+    split = int(np.floor(val_ratio * dataset_size))
+    train_indices, val_indices = indices[split:], indices[:split]
+    
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    
+    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Initialize model - binary segmentation has 1 output channel
+    model = UNet(in_channels=3, out_channels=1).to(device)
+    
+    # Binary segmentation uses BCEWithLogitsLoss
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min',
+        factor=0.5,
+        patience=3,
+        verbose=True
+    )
+    
+    # Training metrics tracking
+    epochs_list = []
+    train_losses = []
+    val_losses = []
+    val_ious = []
+    best_iou = 0.0
+    best_model_path = None
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        epoch_start_time = time.time()
+        
+        # Training phase
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
+        for images, masks in train_pbar:
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs = model(images)
+            
+            # Compute loss
+            loss = criterion(outputs, masks)
+            
+            # Backward pass and optimization
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        
+        # Calculate average training loss
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_iou = 0.0
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [VAL]", leave=True)
+            for images, masks in val_pbar:
+                images = images.to(device)
+                masks = masks.to(device)
+                
+                # Forward pass
+                outputs = model(images)
+                
+                # Compute loss
+                loss = criterion(outputs, masks)
+                val_loss += loss.item()
+                
+                # Apply sigmoid and threshold to get binary predictions
+                preds = (torch.sigmoid(outputs) > 0.5).float()
+                
+                # Calculate IoU for binary segmentation
+                batch_iou = calculate_iou(preds, masks, threshold=0.5)
+                val_iou += batch_iou
+                
+                val_pbar.set_postfix({"loss": f"{loss.item():.4f}", "iou": f"{batch_iou:.4f}"})
+        
+        # Calculate average validation metrics
+        avg_val_loss = val_loss / len(val_loader)
+        avg_val_iou = val_iou / len(val_loader)
+        val_losses.append(avg_val_loss)
+        val_ious.append(avg_val_iou)
+        epochs_list.append(epoch + 1)
+        
+        # Update learning rate scheduler
+        scheduler.step(avg_val_loss)
+        
+        # Calculate elapsed time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Print epoch summary
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f} | "
+              f"Val IoU: {avg_val_iou:.4f} | "
+              f"Time: {epoch_time:.1f}s")
+        
+        # Save the model if it's the best so far
+        if avg_val_iou > best_iou:
+            # Delete previous best model file if it exists
+            if best_model_path and os.path.exists(best_model_path):
+                os.remove(best_model_path)
+                print(f"Removed previous best model: {best_model_path}")
+            
+            best_iou = avg_val_iou
+            best_model_path = os.path.join(model_dir, f"best_model_epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved with IoU: {best_iou:.4f}")
+            
+            # Visualize predictions with best model
+            vis_save_path = os.path.join(viz_dir, f"predictions_epoch_{epoch+1}.png")
+            visualize_binary_predictions(model, full_dataset, device, num_samples=4, save_path=vis_save_path)
+    
+    # Copy the best model as binary_best.pt
+    if best_model_path and os.path.exists(best_model_path):
+        binary_best_path = os.path.join(output_dir, "binary_building_best.pt")
+        shutil.copy2(best_model_path, binary_best_path)
+        print(f"Best model copied to {binary_best_path}")
+    
+    # Create learning curves plot
+    curves_save_path = os.path.join(viz_dir, "learning_curves.png")
+    plot_learning_curves(
+        epochs_list,
+        train_losses,
+        val_losses,
+        val_ious,
+        curves_save_path
+    )
+    
+    # Save final metrics
+    metrics = {
+        "epochs": epochs_list,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_ious": val_ious,
+    }
+    
+    metrics_path = os.path.join(run_dir, f"training_metrics_run{run_num}.txt")
+    with open(metrics_path, "w") as f:
+        for key, values in metrics.items():
+            f.write(f"{key}: {values}\n")
+    
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time/60:.2f} minutes")
+    print(f"Best validation IoU: {best_iou:.4f}")
+    print(f"All artifacts saved to {run_dir}")
+
+
+if __name__ == "__main__":
+    main() 
+
+
+
+train_improved_damage_classifier.py:
+#!/usr/bin/env python3
+# Improved Damage Classification Model using Pre and Post Disaster Images
+# This script implements a damage classification model that analyzes both pre and post-disaster
+# images for significantly improved performance
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import jaccard_score
+import random
+from datetime import datetime
+import time
+import torch.nn.functional as F
+import json
+from PIL import Image, ImageDraw
+import torchvision.transforms as T
+from shapely import wkt
+import shutil
+
+# Add the project root to the Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+sys.path.insert(0, project_root)
+
+# Import from localization_model 
+from scripts.training.localization_model import (
+    UNet, seed_everything, create_versioned_directory, 
+    calculate_iou, plot_learning_curves, FocalLoss
+)
+
+# Damage class mapping
+DAMAGE_CLASS_MAP = {
+    'no-damage': 1,
+    'minor-damage': 2,
+    'major-damage': 3,
+    'destroyed': 4,
+    'un-classified': 1  # Map unclassified to no-damage
+}
+
+class AttentionFusion(nn.Module):
+    """Attention fusion module to combine pre and post disaster features"""
+    def __init__(self, in_channels):
+        super(AttentionFusion, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, pre_feat, post_feat):
+        # Concatenate features along channel dimension
+        concat_feat = torch.cat([pre_feat, post_feat], dim=1)
+        # Generate attention weights
+        attn_weights = self.attention(concat_feat)
+        # Apply attention to post features
+        weighted_post = post_feat * attn_weights
+        # Combine pre and weighted post features
+        fused_feat = pre_feat + weighted_post
+        return fused_feat
+
+class ImprovedDamageClassifier(nn.Module):
+    """
+    Improved damage classifier that uses both pre and post disaster images
+    with an attention fusion mechanism
+    """
+    def __init__(self, in_channels=3, out_channels=5):
+        super(ImprovedDamageClassifier, self).__init__()
+        
+        # Pre-disaster branch - full UNet with output channels
+        self.pre_encoder = UNet(in_channels=in_channels, out_channels=out_channels)
+        
+        # Post-disaster branch - full UNet with output channels 
+        self.post_encoder = UNet(in_channels=in_channels, out_channels=out_channels)
+        
+        # Store the output channels for later use
+        self.out_channels = out_channels
+        
+        # Attention fusion module for combining pre and post features
+        self.attention_fusion = AttentionFusion(in_channels=out_channels)
+        
+        # Final convolution layers to produce class predictions
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(out_channels, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, out_channels, kernel_size=1)
+        )
+        
+    def forward(self, pre_img, post_img):
+        # Get outputs directly from both UNets
+        pre_features = self.pre_encoder(pre_img)
+        post_features = self.post_encoder(post_img)
+        
+        # Fuse features with attention mechanism
+        fused_features = self.attention_fusion(pre_features, post_features)
+        
+        # Final prediction
+        output = self.final_conv(fused_features)
+        
+        return output
+
+class ImprovedDamageDataset(Dataset):
+    """
+    Dataset for improved damage classification that:
+    - Loads pre-disaster and post-disaster satellite images
+    - Creates multi-class masks for damage levels
+    - Returns (pre_image, post_image, damage_mask) triplets 
+    """
+    def __init__(self, 
+                 root_dir,
+                 image_size=256,
+                 use_xy=True,
+                 max_samples=None,
+                 augment=False):
+        """
+        Initialize the improved damage classification dataset.
+        
+        Args:
+            root_dir: Directory where xBD data is stored
+            image_size: Size of the input/output images (square)
+            use_xy: Use 'xy' coordinates if True; else use 'lng_lat'
+            max_samples: Optional limit on the number of samples
+            augment: If True, applies data augmentation
+        """
+        super().__init__()
+        self.root_dir = root_dir
+        self.image_size = image_size
+        self.coord_key = "xy" if use_xy else "lng_lat"
+        self.max_samples = max_samples
+        self.augment = augment
+        
+        # Transforms for the input images
+        self.image_transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Gather all samples from the dataset directory
+        self.samples = self._gather_samples()
+        
+        # Limit the number of samples if specified
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = random.sample(self.samples, self.max_samples)
+            
+        print(f"Loaded {len(self.samples)} samples for improved damage classification")
+    
+    def _gather_samples(self):
+        """
+        Parse the dataset directory to find all valid pre/post-disaster image pairs
+        with corresponding label files
+        """
+        samples = []
+        
+        # Check for flat structure first
+        images_dir = os.path.join(self.root_dir, "images")
+        labels_dir = os.path.join(self.root_dir, "labels")
+        
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            # Process flat directory structure
+            print(f"Detected flat structure at {self.root_dir}")
+            
+            # Find all post-disaster JSON files (which contain damage labels)
+            post_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+            
+            for post_label_file in post_label_files:
+                # Extract base ID from filename
+                base_id = post_label_file.replace("_post_disaster.json", "")
+                post_img_name = base_id + "_post_disaster.png"
+                pre_img_name = base_id + "_pre_disaster.png"
+                pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
+                
+                post_json_path = os.path.join(labels_dir, post_label_file)
+                post_img_path = os.path.join(images_dir, post_img_name)
+                pre_img_path = os.path.join(images_dir, pre_img_name)
+                
+                # Skip if files don't exist
+                if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path) and 
+                        os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                    continue
+                
+                samples.append({
+                    "pre_img_path": pre_img_path,
+                    "post_img_path": post_img_path,
+                    "pre_json_path": pre_json_path,
+                    "post_json_path": post_json_path
+                })
+                
+        else:
+            # Process hierarchical directory structure
+            try:
+                # List all disaster directories
+                disasters = [d for d in os.listdir(self.root_dir)
+                           if os.path.isdir(os.path.join(self.root_dir, d))
+                           and d.lower() != "spacenet_gt"]
+                
+                print(f"Found {len(disasters)} disaster folders")
+                
+                # Process each disaster folder
+                for disaster in disasters:
+                    disaster_dir = os.path.join(self.root_dir, disaster)
+                    images_dir = os.path.join(disaster_dir, "images")
+                    labels_dir = os.path.join(disaster_dir, "labels")
+                    
+                    # Skip if directories don't exist
+                    if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                        print(f"Warning: Missing images or labels directory for disaster: {disaster}")
+                        continue
+                    
+                    # Find all post-disaster JSON files (which contain damage labels)
+                    post_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+                    print(f"Disaster {disaster}: Found {len(post_label_files)} label files")
+                    
+                    # Process each label file
+                    for post_label_file in post_label_files:
+                        base_id = post_label_file.replace("_post_disaster.json", "")
+                        post_img_name = base_id + "_post_disaster.png"
+                        pre_img_name = base_id + "_pre_disaster.png"
+                        pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
+                        
+                        post_json_path = os.path.join(labels_dir, post_label_file)
+                        post_img_path = os.path.join(images_dir, post_img_name)
+                        pre_img_path = os.path.join(images_dir, pre_img_name)
+                        
+                        # Skip if files don't exist
+                        if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path) and 
+                                os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                            continue
+                        
+                        samples.append({
+                            "pre_img_path": pre_img_path,
+                            "post_img_path": post_img_path,
+                            "pre_json_path": pre_json_path,
+                            "post_json_path": post_json_path,
+                            "disaster": disaster
+                        })
+            except Exception as e:
+                print(f"Error gathering samples: {e}")
+        
+        return samples
+    
+    def __len__(self):
+        """Return the number of samples in the dataset."""
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        """
+        Get a single sample from the dataset.
+        Returns:
+            pre_image_tensor: Pre-disaster image tensor
+            post_image_tensor: Post-disaster image tensor
+            damage_mask: Multi-class damage mask with 5 classes
+        """
+        item = self.samples[idx]
+        pre_img_path = item["pre_img_path"]
+        post_img_path = item["post_img_path"]
+        pre_json_path = item["pre_json_path"]
+        post_json_path = item["post_json_path"]
+        
+        try:
+            # Load the pre-disaster and post-disaster images
+            pre_img = Image.open(pre_img_path).convert("RGB")
+            post_img = Image.open(post_img_path).convert("RGB")
+            original_size = pre_img.size  # (width, height)
+            
+            # Create an empty damage mask (0 = background/non-building)
+            damage_mask = Image.new("L", original_size, 0)
+            draw = ImageDraw.Draw(damage_mask)
+            
+            # Load building polygons and damage classes
+            with open(pre_json_path, 'r') as f:
+                pre_json_data = json.load(f)
+                
+            with open(post_json_path, 'r') as f:
+                post_json_data = json.load(f)
+            
+            # Map building IDs to damage classes
+            building_damage = {}
+            post_feats = post_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in post_feats:
+                uid = feat.get("properties", {}).get("uid", None)
+                damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                if uid and damage_type in DAMAGE_CLASS_MAP:
+                    building_damage[uid] = DAMAGE_CLASS_MAP[damage_type]
+            
+            # Extract building polygons from the pre-disaster JSON
+            pre_feats = pre_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in pre_feats:
+                uid = feat.get("properties", {}).get("uid", None)
+                wkt_str = feat.get("wkt", None)
+                
+                if not wkt_str:
+                    continue
+                
+                # Determine damage class for this building
+                # Default to no-damage (class 1) if not found in post-disaster data
+                damage_class = building_damage.get(uid, 1)
+                
+                # Parse the WKT string to get the polygon
+                polygon = wkt.loads(wkt_str)
+                
+                # Convert polygon to a list of (x, y) tuples for PIL's polygon drawing
+                if hasattr(polygon, 'exterior'):
+                    # For simple polygons with exterior coordinates
+                    coords = list(polygon.exterior.coords)
+                else:
+                    # For multipolygons or other geometries, try to extract coordinates
+                    try:
+                        coords = list(polygon.coords)
+                    except:
+                        # Skip polygons that can't be processed
+                        continue
+                
+                # Draw the polygon filled with the appropriate damage class value
+                draw.polygon(coords, fill=damage_class)
+            
+            # Apply augmentation if enabled (with the same transformations to both images)
+            if self.augment:
+                # Same random seed for both transforms to ensure consistency
+                seed = np.random.randint(2147483647)
+                random.seed(seed)
+                torch.manual_seed(seed)
+                
+                # Simple rotation/flip augmentation
+                if random.random() > 0.5:
+                    pre_img = T.functional.hflip(pre_img)
+                    post_img = T.functional.hflip(post_img)
+                    damage_mask = T.functional.hflip(damage_mask)
+                if random.random() > 0.5:
+                    pre_img = T.functional.vflip(pre_img)
+                    post_img = T.functional.vflip(post_img)
+                    damage_mask = T.functional.vflip(damage_mask)
+                if random.random() > 0.5:
+                    angle = random.choice([90, 180, 270])
+                    pre_img = T.functional.rotate(pre_img, angle)
+                    post_img = T.functional.rotate(post_img, angle)
+                    damage_mask = T.functional.rotate(damage_mask, angle)
+                
+                # Color augmentation to pre-disaster image only
+                if random.random() > 0.5:
+                    brightness = random.uniform(0.8, 1.2)
+                    contrast = random.uniform(0.8, 1.2)
+                    saturation = random.uniform(0.8, 1.2)
+                    pre_img = T.functional.adjust_brightness(pre_img, brightness)
+                    pre_img = T.functional.adjust_contrast(pre_img, contrast)
+                    pre_img = T.functional.adjust_saturation(pre_img, saturation)
+            
+            # Apply transforms to convert images to tensors
+            pre_tensor = self.image_transform(pre_img)
+            post_tensor = self.image_transform(post_img)
+            
+            # Resize the damage mask and convert to tensor
+            damage_mask = damage_mask.resize((self.image_size, self.image_size), Image.NEAREST)
+            damage_tensor = torch.from_numpy(np.array(damage_mask)).long()
+            
+            return pre_tensor, post_tensor, damage_tensor
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            # Return placeholder tensors in case of error
+            pre_tensor = torch.zeros(3, self.image_size, self.image_size)
+            post_tensor = torch.zeros(3, self.image_size, self.image_size)
+            damage_tensor = torch.zeros(self.image_size, self.image_size, dtype=torch.long)
+            return pre_tensor, post_tensor, damage_tensor
+
+
+def visualize_improved_predictions(model, dataset, device, num_samples=4, save_path=None):
+    """
+    Visualize improved damage classification predictions
+    """
+    model.eval()
+    # Select random indices
+    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
+    
+    # Define colors for each damage class
+    # Format: [R, G, B]
+    damage_colors = [
+        [0, 0, 0],       # Background (black)
+        [0, 255, 0],     # No damage (green)
+        [255, 255, 0],   # Minor damage (yellow)
+        [255, 165, 0],   # Major damage (orange)
+        [255, 0, 0]      # Destroyed (red)
+    ]
+    
+    # Class names for display
+    class_names = ['Background', 'No Damage', 'Minor Damage', 'Major Damage', 'Destroyed']
+    
+    # Configure the plot
+    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * num_samples))
+    if num_samples == 1:
+        axes = [axes]  # Make sure axes is a list for single sample case
+    
+    # Track per-class IoU
+    class_iou = {cls: [] for cls in range(5)}
+    
+    with torch.no_grad():
+        for i, idx in enumerate(indices):
+            try:
+                # Get sample
+                pre_img, post_img, damage_mask = dataset[idx]
+                pre_img = pre_img.unsqueeze(0).to(device)
+                post_img = post_img.unsqueeze(0).to(device)
+                
+                # Get prediction
+                outputs = model(pre_img, post_img)
+                
+                # Get predicted class for each pixel
+                _, pred_classes = torch.max(outputs, dim=1)
+                
+                # Move tensors to CPU for visualization
+                pred_classes = pred_classes.squeeze().cpu().numpy()
+                damage_mask = damage_mask.cpu().numpy()
+                
+                # Create colored visualizations
+                colored_pred = np.zeros((pred_classes.shape[0], pred_classes.shape[1], 3), dtype=np.uint8)
+                colored_mask = np.zeros((damage_mask.shape[0], damage_mask.shape[1], 3), dtype=np.uint8)
+                
+                # Color each class in the prediction and ground truth
+                for class_idx in range(len(damage_colors)):
+                    colored_pred[pred_classes == class_idx] = damage_colors[class_idx]
+                    colored_mask[damage_mask == class_idx] = damage_colors[class_idx]
+                
+                # Calculate per-class IoU for this sample
+                for cls in range(5):
+                    true_mask = (damage_mask == cls)
+                    pred_mask = (pred_classes == cls)
+                    
+                    intersection = np.logical_and(true_mask, pred_mask).sum()
+                    union = np.logical_or(true_mask, pred_mask).sum()
+                    iou = intersection / union if union > 0 else float('nan')
+                    
+                    if not np.isnan(iou):
+                        class_iou[cls].append(iou)
+                
+                # Denormalize images for display
+                pre_img_np = pre_img.squeeze().cpu().numpy()
+                post_img_np = post_img.squeeze().cpu().numpy()
+                
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                
+                pre_img_np = np.transpose(pre_img_np, (1, 2, 0))
+                pre_img_np = pre_img_np * std + mean
+                pre_img_np = np.clip(pre_img_np, 0, 1)
+                
+                post_img_np = np.transpose(post_img_np, (1, 2, 0))
+                post_img_np = post_img_np * std + mean
+                post_img_np = np.clip(post_img_np, 0, 1)
+                
+                # Plot in the current row
+                axes[i][0].imshow(pre_img_np)
+                axes[i][0].set_title("Pre-disaster Image")
+                axes[i][0].axis('off')
+                
+                axes[i][1].imshow(post_img_np)
+                axes[i][1].set_title("Post-disaster Image")
+                axes[i][1].axis('off')
+                
+                axes[i][2].imshow(colored_mask)
+                axes[i][2].set_title("Ground Truth Damage")
+                axes[i][2].axis('off')
+                
+                axes[i][3].imshow(colored_pred)
+                axes[i][3].set_title("Predicted Damage")
+                axes[i][3].axis('off')
+                
+            except Exception as e:
+                print(f"Error processing sample {idx}: {e}")
+                # In case of error, fill the row with blank plots
+                for j in range(4):
+                    axes[i][j].imshow(np.zeros((10, 10, 3)))
+                    axes[i][j].set_title("Error")
+                    axes[i][j].axis('off')
+    
+    # Calculate average IoU for each class
+    avg_class_iou = {}
+    for cls in range(5):
+        if class_iou[cls]:
+            avg_class_iou[cls] = sum(class_iou[cls]) / len(class_iou[cls])
+        else:
+            avg_class_iou[cls] = float('nan')
+    
+    # Calculate mean IoU (excluding background)
+    valid_ious = [iou for cls, iou in avg_class_iou.items() if cls > 0 and not np.isnan(iou)]
+    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else 0
+    
+    # Add a text box with IoU results
+    plt.figtext(0.5, 0.01, f"Mean IoU (excluding background): {mean_iou:.4f}", ha="center", 
+                fontsize=14, bbox={"facecolor":"white", "alpha":0.5, "pad":5})
+    
+    text = ""
+    for cls in range(5):
+        iou_value = avg_class_iou[cls]
+        iou_str = f"{iou_value:.4f}" if not np.isnan(iou_value) else "N/A"
+        text += f"{class_names[cls]}: {iou_str}   "
+    
+    plt.figtext(0.5, 0.005, text, ha="center", fontsize=12)
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path)
+        print(f"Visualization saved to {save_path}")
+    
+    # Print IoU values
+    print("\nPer-Class IoU:")
+    for cls in range(5):
+        iou_value = avg_class_iou[cls]
+        iou_str = f"{iou_value:.4f}" if not np.isnan(iou_value) else "N/A"
+        print(f"  {class_names[cls]}: {iou_str}")
+    print(f"Mean IoU (excluding background): {mean_iou:.4f}")
+    
+    plt.close()
+    
+    return avg_class_iou, mean_iou
+
+
+def main():
+    """
+    Main function to run the improved damage classification training pipeline.
+    """
+    # Set multiprocessing start method to 'spawn' to avoid CUDA initialization errors
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'")
+    except RuntimeError:
+        print("Multiprocessing start method already set to 'spawn' or could not be set")
+        pass
+        
+    start_time = time.time()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    seed_everything(42)
+    
+    # Get project root directory
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+    
+    # Hyperparameters & settings
+    root_dir = os.path.join(project_root, "data", "xBD")
+    batch_size = 4
+    lr = 0.0002
+    num_epochs = 10
+    val_ratio = 0.2
+    image_size = 256
+    num_classes = 5  # Background + 4 damage classes
+
+    # Create output directory
+    output_dir = os.path.join(project_root, "output", "improved_damage")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create versioned run directory
+    run_dir, run_num = create_versioned_directory(output_dir, prefix="improved_run")
+    model_dir = os.path.join(run_dir, "models")
+    viz_dir = os.path.join(run_dir, "visualizations")
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    # Save configuration
+    config = {
+        "timestamp": timestamp,
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "num_epochs": num_epochs,
+        "val_ratio": val_ratio,
+        "image_size": image_size,
+        "num_classes": num_classes
+    }
+    
+    with open(os.path.join(run_dir, f"config_run{run_num}.txt"), "w") as f:
+        for key, value in config.items():
+            f.write(f"{key}: {value}\n")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Initialize dataset with both pre and post disaster images
+    print("Initializing ImprovedDamageDataset for training...")
+    full_dataset = ImprovedDamageDataset(
+        root_dir=root_dir,
+        image_size=image_size,
+        use_xy=True,
+        augment=True
+    )
+    
+    # Create train-val split
+    dataset_size = len(full_dataset)
+    indices = list(range(dataset_size))
+    random.shuffle(indices)
+    split = int(np.floor(val_ratio * dataset_size))
+    train_indices, val_indices = indices[split:], indices[:split]
+    
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    
+    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    
+    # Calculate class frequencies for weighting
+    print("Calculating class frequencies for weighting...")
+    class_counts = torch.zeros(num_classes)
+    
+    # Keep track of damage class presence in each sample for weighted sampling
+    sample_weights = torch.ones(len(train_indices))
+    
+    for i, idx in enumerate(tqdm(train_indices, desc="Counting class pixels")):
+        _, _, damage_mask = full_dataset[idx]
+        
+        # Count pixels of each class
+        for c in range(num_classes):
+            class_count = (damage_mask == c).sum().item()
+            class_counts[c] += class_count
+            
+            # Give higher weights to samples containing damaged buildings
+            if c >= 2 and class_count > 0:  # If sample has damage
+                damage_weight = (c / num_classes) * 20  # Higher damage classes get higher weights
+                sample_weights[i] = max(sample_weights[i], damage_weight)
+    
+    # Calculate class weights inversely proportional to frequencies
+    total_pixels = class_counts.sum()
+    # Normalized class frequencies
+    class_frequencies = class_counts / total_pixels
+    print(f"Class distribution: {class_frequencies.tolist()}")
+    
+    # Calculate inverse frequency weights and normalize
+    # Adding epsilon (1e-6) to prevent division by zero
+    inverse_freq_weights = 1.0 / (class_frequencies + 1e-6)
+    # Normalize weights to make their mean equal to 1
+    inverse_freq_weights = inverse_freq_weights / inverse_freq_weights.mean()
+    
+    # Apply stronger weighting to rare damage classes
+    inverse_freq_weights[2:] *= 2.0  # Double the weights for damage classes
+    
+    # Cap weights to prevent extremely high values
+    inverse_freq_weights = torch.clamp(inverse_freq_weights, min=0.1, max=20.0)
+    
+    # Move to device
+    class_weights = inverse_freq_weights.to(device)
+    
+    print(f"Calculated class weights: {class_weights.tolist()}")
+    
+    # Create a weighted sampler for training data to balance class representation
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_indices),
+        replacement=True
+    )
+    
+    print("Using weighted sampler to balance training batches")
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=sampler,  # Use weighted sampling
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Initialize improved model that uses both pre and post disaster images
+    model = ImprovedDamageClassifier(in_channels=3, out_channels=num_classes).to(device)
+    
+    # Use Focal Loss with stronger focus on hard examples
+    gamma = 2.5  # Higher value gives more focus to hard examples
+    criterion = FocalLoss(gamma=gamma, alpha=class_weights)
+    
+    # Log the loss function configuration
+    print(f"Using Focal Loss with gamma={gamma} and class weights={class_weights.tolist()}")
+    
+    # Optimizer with weight decay for better regularization
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    
+    # Training metrics tracking
+    epochs_list = []
+    train_losses = []
+    val_losses = []
+    val_ious = []
+    best_iou = 0.0
+    best_model_path = None
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        epoch_start_time = time.time()
+        
+        # Training phase
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
+        for pre_imgs, post_imgs, damage_masks in train_pbar:
+            pre_imgs = pre_imgs.to(device)
+            post_imgs = post_imgs.to(device)
+            damage_masks = damage_masks.to(device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass - outputs shape: [batch_size, num_classes, H, W]
+            outputs = model(pre_imgs, post_imgs)
+            
+            # Compute loss using Focal Loss
+            loss = criterion(outputs, damage_masks)
+            
+            # Backward pass and optimization
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            running_loss += loss.item()
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        
+        # Calculate average training loss
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_iou = 0.0
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [VAL]", leave=True)
+            for pre_imgs, post_imgs, damage_masks in val_pbar:
+                pre_imgs = pre_imgs.to(device)
+                post_imgs = post_imgs.to(device)
+                damage_masks = damage_masks.to(device)
+                
+                # Forward pass
+                outputs = model(pre_imgs, post_imgs)
+                
+                # Compute loss
+                loss = criterion(outputs, damage_masks)
+                val_loss += loss.item()
+                
+                # Get predicted class for each pixel
+                _, preds = torch.max(outputs, dim=1)
+                
+                # Calculate IoU for multi-class segmentation
+                batch_iou = calculate_iou(preds, damage_masks, threshold=0.5, num_classes=num_classes)
+                val_iou += batch_iou
+                
+                val_pbar.set_postfix({"loss": f"{loss.item():.4f}", "iou": f"{batch_iou:.4f}"})
+        
+        # Calculate average validation metrics
+        avg_val_loss = val_loss / len(val_loader)
+        avg_val_iou = val_iou / len(val_loader)
+        val_losses.append(avg_val_loss)
+        val_ious.append(avg_val_iou)
+        epochs_list.append(epoch + 1)
+        
+        # Calculate elapsed time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Print epoch summary
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f} | "
+              f"Val IoU: {avg_val_iou:.4f} | "
+              f"Time: {epoch_time:.1f}s")
+        
+        # Save the model if it's the best so far
+        if avg_val_iou > best_iou:
+            # Delete previous best model file if it exists
+            if best_model_path and os.path.exists(best_model_path):
+                os.remove(best_model_path)
+                print(f"Removed previous best model: {best_model_path}")
+            
+            best_iou = avg_val_iou
+            best_model_path = os.path.join(model_dir, f"best_model_epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved with IoU: {best_iou:.4f}")
+            
+            # Visualize predictions with best model
+            vis_save_path = os.path.join(viz_dir, f"predictions_epoch_{epoch+1}.png")
+            visualize_improved_predictions(model, full_dataset, device, num_samples=4, save_path=vis_save_path)
+    
+    # Copy the best model to the main directory
+    if best_model_path and os.path.exists(best_model_path):
+        improved_best_path = os.path.join(output_dir, "improved_damage_best.pt")
+        shutil.copy2(best_model_path, improved_best_path)
+        print(f"Best model copied to {improved_best_path}")
+    
+    # Create learning curves plot
+    curves_save_path = os.path.join(viz_dir, "learning_curves.png")
+    plot_learning_curves(
+        epochs_list,
+        train_losses,
+        val_losses,
+        val_ious,
+        curves_save_path
+    )
+    
+    # Save final metrics
+    metrics = {
+        "epochs": epochs_list,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_ious": val_ious,
+    }
+    
+    metrics_path = os.path.join(run_dir, f"training_metrics_run{run_num}.txt")
+    with open(metrics_path, "w") as f:
+        for key, values in metrics.items():
+            f.write(f"{key}: {values}\n")
+    
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time/60:.2f} minutes")
+    print(f"Best validation IoU: {best_iou:.4f}")
+    print(f"All artifacts saved to {run_dir}")
+
+
+if __name__ == "__main__":
+    main() 
+
+
+
+
+evaluate_two_stage.py:
+#!/usr/bin/env python3
+# Two-Stage Building Damage Assessment Evaluation
+# This script evaluates the combined building detection and damage classification models
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+import json
+from PIL import Image, ImageDraw
+import random
+import torchvision.transforms as T
+from datetime import datetime
+import shutil
+from pathlib import Path
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+from shapely import wkt
+
+# Add the project root to the Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+sys.path.insert(0, project_root)
+
+# Import from our other scripts
+from scripts.training.localization_model import UNet
+
+# Import the improved damage classifier
+from scripts.training.train_improved_damage_classifier import (
+    ImprovedDamageClassifier, AttentionFusion, ImprovedDamageDataset, DAMAGE_CLASS_MAP
+)
+
+class IntegratedDamageAssessment:
+    """
+    End-to-end model that combines building detection and damage classification
+    in a two-stage approach.
+    """
+    def __init__(
+        self,
+        building_detector_path,
+        damage_classifier_path,
+        device=None,
+        building_threshold=0.5
+    ):
+        """
+        Initialize the integrated model with pre-trained stages.
+        
+        Args:
+            building_detector_path: Path to the saved building detector model
+            damage_classifier_path: Path to the saved damage classifier model
+            device: Device to run inference on
+            building_threshold: Threshold for building detection
+        """
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+        
+        self.building_threshold = building_threshold
+        
+        # Load building detector - binary segmentation model (output: 1 channel)
+        self.building_detector = UNet(in_channels=3, out_channels=1).to(self.device)
+        self.building_detector.load_state_dict(
+            torch.load(building_detector_path, map_location=self.device)
+        )
+        self.building_detector.eval()
+        
+        # Load improved damage classifier (dual-input model)
+        print("Loading improved damage classifier model (dual-input)")
+        self.damage_classifier = ImprovedDamageClassifier(in_channels=3, out_channels=5).to(self.device)
+        self.damage_classifier.load_state_dict(
+            torch.load(damage_classifier_path, map_location=self.device)
+        )
+        
+        # We need to store the post-disaster images for the improved model
+        self.post_disaster_images = {}
+        
+        self.damage_classifier.eval()
+        print("Integrated Damage Assessment model loaded successfully")
+        
+    def predict(self, image_tensor, post_image_tensor=None):
+        """
+        Run the full prediction pipeline on an input image.
+        
+        Args:
+            image_tensor: Pre-disaster image tensor of shape [C, H, W] or [B, C, H, W]
+            post_image_tensor: Post-disaster image tensor, required for the improved model
+            
+        Returns:
+            building_mask: Binary building mask
+            damage_pred: Multi-class damage prediction (5 classes)
+            final_pred: Combined prediction with building detection applied
+        """
+        with torch.no_grad():
+            # Add batch dimension if necessary
+            if image_tensor.dim() == 3:
+                image_tensor = image_tensor.unsqueeze(0)
+            
+            # Move to device
+            image_tensor = image_tensor.to(self.device)
+            
+            # Stage 1: Building Detection
+            building_logits = self.building_detector(image_tensor)
+            building_mask = (torch.sigmoid(building_logits) > self.building_threshold).float()
+            
+            # Stage 2: Damage Classification - requires post-disaster image
+            if post_image_tensor is None:
+                raise ValueError("Post-disaster image is required for the improved model")
+            
+            # Add batch dimension and move to device
+            if post_image_tensor.dim() == 3:
+                post_image_tensor = post_image_tensor.unsqueeze(0)
+            post_image_tensor = post_image_tensor.to(self.device)
+            
+            # Get damage prediction from improved model (dual input)
+            damage_logits = self.damage_classifier(image_tensor, post_image_tensor)
+            
+            # Get class probabilities
+            damage_pred = F.softmax(damage_logits, dim=1)
+            
+            # Combine the stages:
+            # 1. Multiply damage predictions by building mask so only buildings get classified
+            # 2. Use channel 0 (background) where there are no buildings
+            
+            # Expand building mask to match damage_pred dimensions
+            building_mask_expanded = building_mask.expand(-1, damage_pred.size(1), -1, -1)
+            
+            # Create a mask for background (inverse of building mask)
+            background_mask = 1 - building_mask_expanded[:, 0:1]  # Just the first channel
+            background_only = torch.zeros_like(damage_pred)
+            background_only[:, 0:1] = background_mask  # Set only background channel
+            
+            # Apply building mask to damage prediction
+            building_damage = damage_pred * building_mask_expanded
+            
+            # Combine: building_damage + background pixels
+            final_pred = building_damage + background_only
+            
+            # Normalize to ensure valid probability distribution
+            final_pred = final_pred / (final_pred.sum(dim=1, keepdim=True) + 1e-6)
+            
+            return building_mask, damage_pred, final_pred
+
+
+def evaluate_model(integrated_model, dataset, num_samples=None, output_dir=None):
+    """
+    Evaluate the integrated model on a test dataset.
+    
+    Args:
+        integrated_model: IntegratedDamageAssessment model
+        dataset: Test dataset with ground truth
+        num_samples: Number of samples to evaluate (None = all)
+        output_dir: Directory to save visualization images
+    
+    Returns:
+        Dictionary of metrics
+    """
+    device = integrated_model.device
+    class_names = ['Background', 'No Damage', 'Minor Damage', 'Major Damage', 'Destroyed']
+    
+    # Define colors for damage classes
+    damage_colors = [
+        [0, 0, 0],       # Background (black)
+        [0, 255, 0],     # No damage (green)
+        [255, 255, 0],   # Minor damage (yellow)
+        [255, 165, 0],   # Major damage (orange)
+        [255, 0, 0]      # Destroyed (red)
+    ]
+    
+    # Track metrics
+    class_correct = np.zeros(5)
+    class_total = np.zeros(5)
+    class_pred_total = np.zeros(5)
+    confusion = np.zeros((5, 5), dtype=np.int64)
+    
+    # Track building detection metrics
+    total_building_tp = 0
+    total_building_union = 0
+    
+    # Sample indices
+    if num_samples is None or num_samples >= len(dataset):
+        indices = list(range(len(dataset)))
+        num_samples = len(dataset)
+    else:
+        indices = random.sample(range(len(dataset)), num_samples)
+    
+    # Set up visualization directory
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        viz_dir = os.path.join(output_dir, "visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+    
+    # Evaluate all samples
+    for idx, sample_idx in enumerate(tqdm(indices, desc="Evaluating samples")):
+        # Get sample - the dataset should return (pre_img, post_img, building_mask, damage_mask)
+        # or (pre_img, building_mask, damage_mask) for the original dataset
+        sample_data = dataset[sample_idx]
+        
+        # Check if we have post-disaster images (for improved model)
+        if len(sample_data) == 4:  # Pre-image, post-image, building-mask, damage-mask
+            pre_img, post_img, gt_building_mask, gt_damage_mask = sample_data
+        else:  # Original dataset format: pre-image, building-mask, damage-mask
+            pre_img, gt_building_mask, gt_damage_mask = sample_data
+            post_img = None
+        
+        # Get predictions
+        with torch.no_grad():
+            # Run the integrated model
+            building_mask, damage_pred, final_pred = integrated_model.predict(pre_img, post_img)
+            
+            # Get class predictions
+            _, pred_classes = torch.max(final_pred, dim=1)
+            
+            # Move to CPU and numpy for evaluation
+            pred_classes = pred_classes.squeeze().cpu().numpy()
+            building_mask = building_mask.squeeze().cpu().numpy()
+            gt_building_mask = gt_building_mask.squeeze().cpu().numpy()
+            gt_damage_mask = gt_damage_mask.cpu().numpy()
+            
+            # Calculate metrics
+            # True positive for buildings
+            building_tp = np.logical_and(building_mask > 0.5, gt_building_mask > 0.5).sum()
+            # Building IoU
+            building_union = np.logical_or(building_mask > 0.5, gt_building_mask > 0.5).sum()
+            building_iou = building_tp / building_union if building_union > 0 else 0
+            
+            # Accumulate building detection metrics
+            total_building_tp += building_tp
+            total_building_union += building_union
+            
+            # Update pixel-level confusion matrix
+            for y in range(pred_classes.shape[0]):
+                for x in range(pred_classes.shape[1]):
+                    pred_class = pred_classes[y, x]
+                    true_class = gt_damage_mask[y, x]
+                    confusion[true_class, pred_class] += 1
+            
+            # Calculate per-class metrics
+            for cls in range(5):
+                # True pixels of this class
+                true_pixels = (gt_damage_mask == cls)
+                # Predicted pixels of this class
+                pred_pixels = (pred_classes == cls)
+                
+                # Update totals
+                class_total[cls] += true_pixels.sum()
+                class_pred_total[cls] += pred_pixels.sum()
+                
+                # True positives (correctly classified)
+                correct = np.logical_and(true_pixels, pred_pixels).sum()
+                class_correct[cls] += correct
+        
+        # Create visualizations for a few samples
+        if output_dir and idx < 10:  # Only visualize the first 10 samples
+            # Create colored visualizations
+            colored_pred = np.zeros((pred_classes.shape[0], pred_classes.shape[1], 3), dtype=np.uint8)
+            colored_gt = np.zeros((gt_damage_mask.shape[0], gt_damage_mask.shape[1], 3), dtype=np.uint8)
+            building_colored = np.zeros((building_mask.shape[0], building_mask.shape[1], 3), dtype=np.uint8)
+            gt_building_colored = np.zeros((gt_building_mask.shape[0], gt_building_mask.shape[1], 3), dtype=np.uint8)
+            
+            # Color each class in the prediction and ground truth
+            for class_idx in range(len(damage_colors)):
+                colored_pred[pred_classes == class_idx] = damage_colors[class_idx]
+                colored_gt[gt_damage_mask == class_idx] = damage_colors[class_idx]
+            
+            # Color building masks
+            building_colored[building_mask > 0.5] = [255, 255, 255]
+            gt_building_colored[gt_building_mask > 0.5] = [255, 255, 255]
+            
+            # Prepare image for display
+            pre_img_np = pre_img.squeeze().cpu().numpy()
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            pre_img_np = np.transpose(pre_img_np, (1, 2, 0))
+            pre_img_np = pre_img_np * std + mean
+            pre_img_np = np.clip(pre_img_np, 0, 1)
+            
+            # Create figure with appropriate number of rows/columns
+            if post_img is not None:
+                # Create a larger figure to accommodate post-disaster image
+                fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+                
+                # Also prepare post-disaster image
+                post_img_np = post_img.squeeze().cpu().numpy()
+                post_img_np = np.transpose(post_img_np, (1, 2, 0))
+                post_img_np = post_img_np * std + mean
+                post_img_np = np.clip(post_img_np, 0, 1)
+                
+                # Plot results
+                axes[0, 0].imshow(pre_img_np)
+                axes[0, 0].set_title("Pre-disaster Image")
+                axes[0, 0].axis('off')
+                
+                axes[0, 1].imshow(post_img_np)
+                axes[0, 1].set_title("Post-disaster Image")
+                axes[0, 1].axis('off')
+                
+                axes[0, 2].imshow(gt_building_colored)
+                axes[0, 2].set_title("Ground Truth Buildings")
+                axes[0, 2].axis('off')
+                
+                axes[0, 3].imshow(building_colored)
+                axes[0, 3].set_title(f"Predicted Buildings (IoU: {building_iou:.4f})")
+                axes[0, 3].axis('off')
+                
+                axes[1, 0].imshow(pre_img_np)
+                axes[1, 0].set_title("Pre-disaster Image")
+                axes[1, 0].axis('off')
+                
+                axes[1, 1].imshow(post_img_np)
+                axes[1, 1].set_title("Post-disaster Image")
+                axes[1, 1].axis('off')
+                
+                axes[1, 2].imshow(colored_gt)
+                axes[1, 2].set_title("Ground Truth Damage")
+                axes[1, 2].axis('off')
+                
+                axes[1, 3].imshow(colored_pred)
+                axes[1, 3].set_title("Predicted Damage")
+                axes[1, 3].axis('off')
+            else:
+                # Standard 2x3 figure for original model
+                fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+                
+                # Plot results
+                axes[0, 0].imshow(pre_img_np)
+                axes[0, 0].set_title("Pre-disaster Image")
+                axes[0, 0].axis('off')
+                
+                axes[0, 1].imshow(gt_building_colored)
+                axes[0, 1].set_title("Ground Truth Buildings")
+                axes[0, 1].axis('off')
+                
+                axes[0, 2].imshow(building_colored)
+                axes[0, 2].set_title(f"Predicted Buildings (IoU: {building_iou:.4f})")
+                axes[0, 2].axis('off')
+                
+                axes[1, 0].imshow(pre_img_np)
+                axes[1, 0].set_title("Pre-disaster Image")
+                axes[1, 0].axis('off')
+                
+                axes[1, 1].imshow(colored_gt)
+                axes[1, 1].set_title("Ground Truth Damage")
+                axes[1, 1].axis('off')
+                
+                axes[1, 2].imshow(colored_pred)
+                axes[1, 2].set_title("Predicted Damage")
+                axes[1, 2].axis('off')
+            
+            plt.tight_layout()
+            
+            # Save the visualization
+            fig_path = os.path.join(viz_dir, f"sample_{sample_idx}.png")
+            plt.savefig(fig_path)
+            plt.close()
+    
+    # Calculate overall metrics
+    metrics = {}
+    
+    # Calculate building detection IoU using the accumulated values
+    metrics["building_iou"] = total_building_tp / total_building_union if total_building_union > 0 else 0
+    
+    # Calculate per-class IoU for damage classification
+    class_iou = {}
+    for cls in range(5):
+        union = class_total[cls] + class_pred_total[cls] - class_correct[cls]
+        if class_total[cls] == 0:
+            class_iou[cls] = float('nan')  # No ground truth pixels for this class
+        else:
+            class_iou[cls] = class_correct[cls] / union if union > 0 else 0
+    
+    # Calculate mean IoU across all damage classes
+    valid_ious = [iou for cls, iou in class_iou.items() if not np.isnan(iou)]
+    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else 0
+    
+    # Store class IoUs in metrics
+    metrics["class_iou"] = class_iou
+    metrics["mean_damage_iou"] = mean_iou
+    
+    # Calculate per-class precision and recall
+    precision = {}
+    recall = {}
+    f1_score = {}
+    
+    for cls in range(5):
+        # Precision: TP / (TP + FP)
+        if class_pred_total[cls] == 0:
+            precision[cls] = float('nan')  # No predictions for this class
+        else:
+            precision[cls] = class_correct[cls] / class_pred_total[cls]
+        
+        # Recall: TP / (TP + FN)
+        if class_total[cls] == 0:
+            recall[cls] = float('nan')  # No ground truth pixels for this class
+        else:
+            recall[cls] = class_correct[cls] / class_total[cls]
+        
+        # F1 Score: 2 * (precision * recall) / (precision + recall)
+        if np.isnan(precision[cls]) or np.isnan(recall[cls]) or (precision[cls] + recall[cls] == 0):
+            f1_score[cls] = float('nan')
+        else:
+            f1_score[cls] = 2 * (precision[cls] * recall[cls]) / (precision[cls] + recall[cls])
+    
+    # Store metrics
+    metrics["precision"] = precision
+    metrics["recall"] = recall
+    metrics["f1_score"] = f1_score
+    
+    # Create confusion matrix visualization
+    if output_dir:
+        plt.figure(figsize=(10, 8))
+        # Normalize by ground truth (rows)
+        confusion_norm = confusion.astype('float') / (confusion.sum(axis=1)[:, np.newaxis] + 1e-6)
+        sns.heatmap(
+            confusion_norm, 
+            annot=True, 
+            fmt='.2f', 
+            cmap='Blues',
+            xticklabels=class_names,
+            yticklabels=class_names
+        )
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix (Normalized)')
+        conf_matrix_path = os.path.join(output_dir, "confusion_matrix.png")
+        plt.savefig(conf_matrix_path)
+        plt.close()
+        
+        # Save raw confusion matrix to file
+        np.save(os.path.join(output_dir, "confusion_matrix.npy"), confusion)
+    
+    # Print summary metrics
+    print("\n--- Two-Stage Model Evaluation Results ---")
+    print(f"Number of samples evaluated: {num_samples}")
+    print(f"Building Detection IoU: {metrics['building_iou']:.4f}")
+    print(f"Mean Damage IoU: {metrics['mean_damage_iou']:.4f}")
+    
+    print("\nPer-Class Damage Assessment Metrics:")
+    for cls in range(5):
+        class_name = class_names[cls]
+        iou_val = class_iou[cls]
+        prec_val = precision[cls]
+        rec_val = recall[cls]
+        f1_val = f1_score[cls]
+        
+        iou_str = f"{iou_val:.4f}" if not np.isnan(iou_val) else "N/A"
+        prec_str = f"{prec_val:.4f}" if not np.isnan(prec_val) else "N/A"
+        rec_str = f"{rec_val:.4f}" if not np.isnan(rec_val) else "N/A"
+        f1_str = f"{f1_val:.4f}" if not np.isnan(f1_val) else "N/A"
+        
+        print(f"  {class_name}: IoU={iou_str}, Precision={prec_str}, Recall={rec_str}, F1={f1_str}")
+    
+    # If output directory is provided, save results to file
+    if output_dir:
+        results_path = os.path.join(output_dir, "evaluation_results.txt")
+        with open(results_path, "w") as f:
+            f.write("Two-Stage Model Evaluation Results\n")
+            f.write(f"Number of samples evaluated: {num_samples}\n")
+            f.write(f"Building Detection IoU: {metrics['building_iou']:.4f}\n")
+            f.write(f"Mean Damage IoU: {metrics['mean_damage_iou']:.4f}\n\n")
+            
+            f.write("Per-Class Damage Assessment Metrics:\n")
+            for cls in range(5):
+                class_name = class_names[cls]
+                iou_val = class_iou[cls]
+                prec_val = precision[cls]
+                rec_val = recall[cls]
+                f1_val = f1_score[cls]
+                
+                iou_str = f"{iou_val:.4f}" if not np.isnan(iou_val) else "N/A"
+                prec_str = f"{prec_val:.4f}" if not np.isnan(prec_val) else "N/A"
+                rec_str = f"{rec_val:.4f}" if not np.isnan(rec_val) else "N/A"
+                f1_str = f"{f1_val:.4f}" if not np.isnan(f1_val) else "N/A"
+                
+                f.write(f"  {class_name}: IoU={iou_str}, Precision={prec_str}, Recall={rec_str}, F1={f1_str}\n")
+    
+    return metrics
+
+
+# Create a special dataset class for evaluation with the improved model
+class ImprovedEvaluationDataset(Dataset):
+    """
+    Dataset for evaluating the improved damage classification model.
+    Provides both pre and post disaster images along with ground truth masks.
+    """
+    def __init__(self, 
+                 root_dir,
+                 building_detector_path,
+                 device,
+                 image_size=256,
+                 use_xy=True,
+                 augment=False):
+        
+        # We need the building detector only to use the same image transformation pipeline
+        # but we'll use ground truth masks instead of detector predictions
+        self.device = device
+        self.image_size = image_size
+        self.use_xy = use_xy
+        self.augment = augment
+        self.root_dir = root_dir
+        
+        # Load building detector just for reference but we won't use it for prediction
+        self.building_detector = UNet(in_channels=3, out_channels=1).to(device)
+        self.building_detector.load_state_dict(
+            torch.load(building_detector_path, map_location=device)
+        )
+        self.building_detector.eval()
+        
+        # Image transforms
+        self.image_transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Set coordinate key based on preference
+        self.coord_key = "xy" if use_xy else "wkt"
+        
+        # Gather samples with both pre and post disaster images
+        self.samples = self._gather_samples()
+        
+        print(f"Initialized ImprovedEvaluationDataset with {len(self.samples)} samples")
+    
+    def _gather_samples(self):
+        """
+        Parse the dataset directory to find all valid samples with pre and post disaster images
+        and corresponding JSON labels.
+        """
+        samples = []
+        
+        # Check for flat structure first
+        images_dir = os.path.join(self.root_dir, "images")
+        labels_dir = os.path.join(self.root_dir, "labels")
+        
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            # Process flat directory structure
+            print(f"Detected flat structure at {self.root_dir}")
+            
+            # Find all pre-disaster JSON files
+            pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+            
+            for pre_label_file in pre_label_files:
+                # Extract base ID from filename
+                base_id = pre_label_file.replace("_pre_disaster.json", "")
+                pre_img_name = base_id + "_pre_disaster.png"
+                post_img_name = base_id + "_post_disaster.png"
+                post_label_file = base_id + "_post_disaster.json"
+                
+                pre_json_path = os.path.join(labels_dir, pre_label_file)
+                pre_img_path = os.path.join(images_dir, pre_img_name)
+                post_img_path = os.path.join(images_dir, post_img_name)
+                post_json_path = os.path.join(labels_dir, post_label_file)
+                
+                # Skip if files don't exist
+                if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path) and 
+                        os.path.isfile(post_img_path) and os.path.isfile(post_json_path)):
+                    continue
+                
+                samples.append({
+                    "pre_img_path": pre_img_path,
+                    "post_img_path": post_img_path,
+                    "pre_json_path": pre_json_path,
+                    "post_json_path": post_json_path
+                })
+                
+        else:
+            # Process hierarchical directory structure
+            try:
+                # List all disaster directories
+                disasters = [d for d in os.listdir(self.root_dir)
+                            if os.path.isdir(os.path.join(self.root_dir, d))
+                            and d.lower() != "spacenet_gt"]
+                
+                print(f"Found {len(disasters)} disaster folders")
+                
+                # Process each disaster folder
+                for disaster in disasters:
+                    disaster_dir = os.path.join(self.root_dir, disaster)
+                    images_dir = os.path.join(disaster_dir, "images")
+                    labels_dir = os.path.join(disaster_dir, "labels")
+                    
+                    # Skip if directories don't exist
+                    if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                        print(f"Warning: Missing images or labels directory for disaster: {disaster}")
+                        continue
+                    
+                    # Find all pre-disaster JSON files
+                    pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+                    print(f"Disaster {disaster}: Found {len(pre_label_files)} label files")
+                    
+                    # Process each label file
+                    for pre_label_file in pre_label_files:
+                        base_id = pre_label_file.replace("_pre_disaster.json", "")
+                        pre_img_name = base_id + "_pre_disaster.png"
+                        post_img_name = base_id + "_post_disaster.png"
+                        post_label_file = base_id + "_post_disaster.json"
+                        
+                        pre_json_path = os.path.join(labels_dir, pre_label_file)
+                        pre_img_path = os.path.join(images_dir, pre_img_name)
+                        post_img_path = os.path.join(images_dir, post_img_name)
+                        post_json_path = os.path.join(labels_dir, post_label_file)
+                        
+                        # Skip if files don't exist
+                        if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path) and 
+                                os.path.isfile(post_img_path) and os.path.isfile(post_json_path)):
+                            continue
+                        
+                        samples.append({
+                            "pre_img_path": pre_img_path,
+                            "post_img_path": post_img_path,
+                            "pre_json_path": pre_json_path,
+                            "post_json_path": post_json_path,
+                            "disaster": disaster
+                        })
+            except Exception as e:
+                print(f"Error gathering samples: {e}")
+        
+        return samples
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        """
+        Get a single sample from the dataset with pre and post disaster images 
+        and ground truth masks for building footprints and damage classification.
+        
+        Returns:
+            pre_img: Pre-disaster image tensor
+            post_img: Post-disaster image tensor
+            building_mask: Ground truth binary building mask
+            damage_mask: Ground truth multi-class damage mask
+        """
+        item = self.samples[idx]
+        pre_img_path = item["pre_img_path"]
+        post_img_path = item["post_img_path"]
+        pre_json_path = item["pre_json_path"]
+        post_json_path = item["post_json_path"]
+        
+        try:
+            # Load pre and post disaster images
+            pre_img = Image.open(pre_img_path).convert("RGB")
+            post_img = Image.open(post_img_path).convert("RGB")
+            original_size = pre_img.size  # (width, height)
+            
+            # Create empty building mask and damage mask
+            building_mask = Image.new("L", original_size, 0)
+            damage_mask = Image.new("L", original_size, 0)
+            building_draw = ImageDraw.Draw(building_mask)
+            damage_draw = ImageDraw.Draw(damage_mask)
+            
+            # First, create a mapping of building UIDs to damage classes from post-disaster JSON
+            with open(post_json_path, 'r') as f:
+                post_json_data = json.load(f)
+            
+            # Map building IDs to damage classes
+            building_damage = {}
+            post_feats = post_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in post_feats:
+                uid = feat.get("properties", {}).get("uid", None)
+                damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                if uid and damage_type in DAMAGE_CLASS_MAP:
+                    building_damage[uid] = DAMAGE_CLASS_MAP[damage_type]
+            
+            # Now load pre-disaster JSON to get building polygon geometries
+            with open(pre_json_path, 'r') as f:
+                pre_json_data = json.load(f)
+            
+            # Extract building polygons from the pre-disaster JSON
+            pre_feats = pre_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in pre_feats:
+                uid = feat.get("properties", {}).get("uid", None)
+                wkt_str = feat.get("wkt", None)
+                
+                if not wkt_str:
+                    continue
+                
+                # Determine damage class for this building
+                # Default to no-damage (class 1) if not found in post-disaster data
+                damage_class = building_damage.get(uid, 1)
+                
+                # Parse the WKT string to get the polygon
+                polygon = wkt.loads(wkt_str)
+                
+                # Convert polygon to a list of (x, y) tuples for PIL's polygon drawing
+                if hasattr(polygon, 'exterior'):
+                    # For simple polygons with exterior coordinates
+                    coords = list(polygon.exterior.coords)
+                else:
+                    # For multipolygons or other geometries, try to extract coordinates
+                    try:
+                        coords = list(polygon.coords)
+                    except:
+                        # Skip polygons that can't be processed
+                        continue
+                
+                # Draw the polygon filled on both masks
+                building_draw.polygon(coords, fill=1)  # 1 = building
+                damage_draw.polygon(coords, fill=damage_class)  # Fill with damage class
+            
+            # Apply transforms to images
+            pre_img_tensor = self.image_transform(pre_img)
+            post_img_tensor = self.image_transform(post_img)
+            
+            # Resize masks and convert to tensors
+            building_mask = building_mask.resize((self.image_size, self.image_size), Image.NEAREST)
+            damage_mask = damage_mask.resize((self.image_size, self.image_size), Image.NEAREST)
+            
+            building_tensor = torch.from_numpy(np.array(building_mask)).float().unsqueeze(0)
+            damage_tensor = torch.from_numpy(np.array(damage_mask)).long()
+            
+            return pre_img_tensor, post_img_tensor, building_tensor, damage_tensor
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            # Return placeholder tensors in case of error
+            pre_img_tensor = torch.zeros(3, self.image_size, self.image_size)
+            post_img_tensor = torch.zeros(3, self.image_size, self.image_size)
+            building_tensor = torch.zeros(1, self.image_size, self.image_size)
+            damage_tensor = torch.zeros(self.image_size, self.image_size, dtype=torch.long)
+            return pre_img_tensor, post_img_tensor, building_tensor, damage_tensor
+
+
+def main():
+    # Set multiprocessing start method to 'spawn' to avoid CUDA initialization errors
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'")
+    except RuntimeError:
+        print("Multiprocessing start method already set to 'spawn' or could not be set")
+        pass
+        
+    # Get project paths
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+    
+    # Model paths
+    building_detector_path = os.path.join(project_root, "output", "binary_building", "binary_building_best.pt")
+    
+    # Check if improved damage classifier exists first
+    improved_damage_path = os.path.join(project_root, "output", "improved_damage", "improved_damage_best.pt")
+
+    # Only use the improved damage classifier
+    if os.path.exists(improved_damage_path):
+        damage_classifier_path = improved_damage_path
+        print(f"Using improved damage classifier: {improved_damage_path}")
+    else:
+        print(f"ERROR: Improved damage classifier model not found at: {improved_damage_path}")
+        print("Please train the improved damage classifier using scripts/training/train_improved_damage_classifier.py")
+        return
+
+    # Verify that the model files exist
+    if not os.path.exists(building_detector_path):
+        print(f"ERROR: Building detector model not found at: {building_detector_path}")
+        print("Please train the building detector first using scripts/training/train_building_detector.py")
+        return
+    
+    # Create output directory for evaluation results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(project_root, "output", "evaluation_two_stage", f"eval_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Settings
+    image_size = 256
+    use_xy = True
+    test_ratio = 0.2  # Portion of dataset to use for testing
+    
+    # Dataset path
+    root_dir = os.path.join(project_root, "data", "xBD")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Load the integrated model
+    integrated_model = IntegratedDamageAssessment(
+        building_detector_path=building_detector_path,
+        damage_classifier_path=damage_classifier_path,
+        device=device,
+        building_threshold=0.5  # Threshold for building detection
+    )
+    
+    # Create a dataset for evaluation
+    print("Initializing test dataset...")
+    try:
+        test_dataset = ImprovedEvaluationDataset(
+            root_dir=root_dir,
+            building_detector_path=building_detector_path,
+            device=device,
+            image_size=image_size,
+            use_xy=use_xy,
+            augment=False  # No augmentation for testing
+        )
+    except Exception as e:
+        print(f"Error initializing ImprovedEvaluationDataset: {e}")
+        print("Cannot run evaluation without the improved dataset that provides post-disaster images")
+        return
+    
+    # Determine test samples
+    # Choose either a random subset or all samples depending on test_ratio
+    dataset_size = len(test_dataset)
+    num_test_samples = int(dataset_size * test_ratio)
+    
+    print(f"Evaluating on {num_test_samples} samples from a dataset of {dataset_size} total samples")
+    
+    # Run evaluation
+    metrics = evaluate_model(
+        integrated_model=integrated_model,
+        dataset=test_dataset,
+        num_samples=num_test_samples,
+        output_dir=output_dir
+    )
+    
+    print(f"Evaluation complete. Results saved to: {output_dir}")
+    
+    # Save the model configuration
+    config = {
+        "timestamp": timestamp,
+        "building_detector_path": building_detector_path,
+        "damage_classifier_path": damage_classifier_path,
+        "building_threshold": 0.5,
+        "image_size": image_size,
+        "test_samples": num_test_samples,
+        "building_iou": metrics["building_iou"],
+        "mean_damage_iou": metrics["mean_damage_iou"]
+    }
+    
+    config_path = os.path.join(output_dir, "config.txt")
+    with open(config_path, "w") as f:
+        for key, value in config.items():
+            f.write(f"{key}: {value}\n")
+
+
+if __name__ == "__main__":
+    main() 

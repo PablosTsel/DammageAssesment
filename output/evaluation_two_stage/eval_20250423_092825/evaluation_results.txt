@@ -1,0 +1,11 @@
+Two-Stage Model Evaluation Results
+Number of samples evaluated: 1833
+Building Detection IoU: 0.6645
+Mean Damage IoU: 0.3002
+
+Per-Class Damage Assessment Metrics:
+  Background: IoU=0.9877, Precision=0.9921, Recall=0.9955, F1=0.9938
+  No Damage: IoU=0.1115, Precision=0.8526, Recall=0.1137, F1=0.2006
+  Minor Damage: IoU=0.0807, Precision=0.0951, Recall=0.3476, F1=0.1493
+  Major Damage: IoU=0.1388, Precision=0.1610, Recall=0.5014, F1=0.2438
+  Destroyed: IoU=0.1825, Precision=0.1969, Recall=0.7139, F1=0.3086

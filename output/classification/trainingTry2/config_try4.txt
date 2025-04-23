@@ -1,8 +1,0 @@
-timestamp: 20250306_124322
-batch_size: 32
-learning_rate: 0.0001
-num_epochs: 20
-val_ratio: 0.15
-use_focal_loss: True
-use_mixup: False
-weight_scale: 0.7

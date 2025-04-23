@@ -8,7 +8,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, Subset
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,12 +29,73 @@ import shutil
 BUILDING_LABEL = 1
 NON_BUILDING_LABEL = 0
 
+# Add Focal Loss implementation for better handling of class imbalance
+class FocalLoss(nn.Module):
+    """
+    Focal Loss implementation for multi-class segmentation with class imbalance.
+    Based on https://arxiv.org/pdf/1708.02002.pdf
+    
+    This loss function down-weights well-classified examples and focuses training on hard examples.
+    """
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # Class weights
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        """
+        Calculate focal loss.
+        Args:
+            inputs: Predictions from model (N, C, H, W) as logits
+            targets: Ground truth labels (N, H, W) as class indices
+        """
+        # Apply log softmax to get log probabilities
+        log_softmax = F.log_softmax(inputs, dim=1)
+        
+        # Gather the log softmax using the target indices
+        # This gets the log probability of the correct class for each pixel
+        batch_size = inputs.size(0)
+        loss = torch.zeros_like(targets, dtype=inputs.dtype).to(inputs.device)
+        
+        for cls in range(inputs.size(1)):
+            # Create a mask for this class
+            target_mask = (targets == cls)
+            if target_mask.sum() > 0:
+                # Extract log probabilities for this class
+                class_log_prob = log_softmax[:, cls, :, :]
+                
+                # Compute probability of correct class
+                class_prob = torch.exp(class_log_prob)
+                
+                # Focal loss weighting: (1-pt)^gamma
+                modulating_factor = (1.0 - class_prob) ** self.gamma
+                
+                # Apply focal loss to the masked positions
+                class_loss = -modulating_factor * class_log_prob
+                
+                # Apply alpha weighting if specified
+                if self.alpha is not None:
+                    alpha_weight = self.alpha[cls]
+                    class_loss = alpha_weight * class_loss
+                
+                # Update the loss for this class
+                loss[target_mask] = class_loss[target_mask]
+                
+        # Apply reduction
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        else:
+            return loss
+
 # Dataset class for building segmentation
 class XBDBuildingSegDataset(Dataset):
     """
     Dataset for building segmentation that:
     - Loads pre-disaster satellite images
-    - Converts building polygons from JSON files to binary masks
+    - Converts building polygons from JSON files to multi-class masks with damage levels
     - Returns (image, mask) pairs for training a segmentation model
     """
     def __init__(self, 
@@ -63,6 +124,15 @@ class XBDBuildingSegDataset(Dataset):
         self.flat_structure = flat_structure
         self.augment = augment
         
+        # Define damage class mapping (0 is background/non-building)
+        self.damage_class_map = {
+            'no-damage': 1,
+            'minor-damage': 2,
+            'major-damage': 3,
+            'destroyed': 4,
+            'un-classified': 1  # Map unclassified to no-damage
+        }
+        
         # Transforms for the input images
         self.image_transform = T.Compose([
             T.Resize((image_size, image_size)),
@@ -82,8 +152,8 @@ class XBDBuildingSegDataset(Dataset):
     
     def _gather_samples(self):
         """
-        Parse the dataset directory to find all valid pre-disaster images with JSON labels.
-        Returns a list of dictionaries with paths to images and corresponding label files.
+        Parse the dataset directory to find all valid pre-disaster images with 
+        both pre and post-disaster JSON labels for damage classification.
         """
         samples = []
         
@@ -95,24 +165,28 @@ class XBDBuildingSegDataset(Dataset):
             # Process flat directory structure
             print(f"Detected flat structure at {self.root_dir}")
             
-            # Find all pre-disaster JSON files (which contain building polygons)
-            label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+            # Find all pre-disaster JSON files
+            pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
             
-            for label_file in label_files:
+            for pre_label_file in pre_label_files:
                 # Extract base ID from filename
-                base_id = label_file.replace("_pre_disaster.json", "")
+                base_id = pre_label_file.replace("_pre_disaster.json", "")
                 pre_img_name = base_id + "_pre_disaster.png"
+                post_label_file = base_id + "_post_disaster.json"
                 
-                pre_json_path = os.path.join(labels_dir, label_file)
+                pre_json_path = os.path.join(labels_dir, pre_label_file)
                 pre_img_path = os.path.join(images_dir, pre_img_name)
+                post_json_path = os.path.join(labels_dir, post_label_file)
                 
                 # Skip if files don't exist
-                if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path) and 
+                        os.path.isfile(post_json_path)):
                     continue
                 
                 samples.append({
                     "img_path": pre_img_path,
-                    "json_path": pre_json_path
+                    "pre_json_path": pre_json_path,
+                    "post_json_path": post_json_path
                 })
                 
         else:
@@ -137,24 +211,28 @@ class XBDBuildingSegDataset(Dataset):
                         continue
                     
                     # Find all pre-disaster JSON files
-                    label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
-                    print(f"Disaster {disaster}: Found {len(label_files)} label files")
+                    pre_label_files = [f for f in os.listdir(labels_dir) if f.endswith("_pre_disaster.json")]
+                    print(f"Disaster {disaster}: Found {len(pre_label_files)} label files")
                     
                     # Process each label file
-                    for label_file in label_files:
-                        base_id = label_file.replace("_pre_disaster.json", "")
+                    for pre_label_file in pre_label_files:
+                        base_id = pre_label_file.replace("_pre_disaster.json", "")
                         pre_img_name = base_id + "_pre_disaster.png"
+                        post_label_file = base_id + "_post_disaster.json"
                         
-                        pre_json_path = os.path.join(labels_dir, label_file)
+                        pre_json_path = os.path.join(labels_dir, pre_label_file)
                         pre_img_path = os.path.join(images_dir, pre_img_name)
+                        post_json_path = os.path.join(labels_dir, post_label_file)
                         
                         # Skip if files don't exist
-                        if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                        if not (os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path) and 
+                                os.path.isfile(post_json_path)):
                             continue
                         
                         samples.append({
                             "img_path": pre_img_path,
-                            "json_path": pre_json_path,
+                            "pre_json_path": pre_json_path,
+                            "post_json_path": post_json_path,
                             "disaster": disaster
                         })
             except Exception as e:
@@ -169,33 +247,53 @@ class XBDBuildingSegDataset(Dataset):
     def __getitem__(self, idx):
         """
         Get a single sample from the dataset.
-        Returns the pre-disaster image and corresponding building mask.
+        Returns the pre-disaster image and corresponding multi-class damage mask.
         """
         item = self.samples[idx]
         img_path = item["img_path"]
-        json_path = item["json_path"]
+        pre_json_path = item["pre_json_path"]
+        post_json_path = item["post_json_path"]
         
         try:
             # Load the pre-disaster image
             img = Image.open(img_path).convert("RGB")
             original_size = img.size  # (width, height)
             
-            # Create an empty mask of the same size as the original image
+            # Create an empty mask (0 = background/non-building)
             mask = Image.new("L", original_size, 0)
             draw = ImageDraw.Draw(mask)
             
-            # Load the JSON data
-            with open(json_path, 'r') as f:
-                json_data = json.load(f)
+            # First, create a mapping of building UIDs to damage classes from post-disaster JSON
+            with open(post_json_path, 'r') as f:
+                post_json_data = json.load(f)
             
-            # Extract building polygons from the JSON
-            feats = json_data.get("features", {}).get(self.coord_key, [])
-            for feat in feats:
+            # Map building IDs to damage classes
+            building_damage = {}
+            post_feats = post_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in post_feats:
+                uid = feat.get("properties", {}).get("uid", None)
+                damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                if uid and damage_type in self.damage_class_map:
+                    building_damage[uid] = self.damage_class_map[damage_type]
+            
+            # Now load pre-disaster JSON to get building polygon geometries
+            with open(pre_json_path, 'r') as f:
+                pre_json_data = json.load(f)
+            
+            # Extract building polygons from the pre-disaster JSON
+            pre_feats = pre_json_data.get("features", {}).get(self.coord_key, [])
+            for feat in pre_feats:
+                uid = feat.get("properties", {}).get("uid", None)
                 wkt_str = feat.get("wkt", None)
-                if wkt_str is None:
+                
+                if not wkt_str:
                     continue
                 
-                # Parse the WKT string to get the polygon and fill it in the mask
+                # Determine damage class for this building
+                # Default to no-damage (class 1) if not found in post-disaster data
+                damage_class = building_damage.get(uid, 1)
+                
+                # Parse the WKT string to get the polygon
                 polygon = wkt.loads(wkt_str)
                 
                 # Convert polygon to a list of (x, y) tuples for PIL's polygon drawing
@@ -210,8 +308,8 @@ class XBDBuildingSegDataset(Dataset):
                         # Skip polygons that can't be processed
                         continue
                 
-                # Draw the polygon as filled on the mask (255 for building pixels)
-                draw.polygon(coords, fill=255)
+                # Draw the polygon filled with the appropriate damage class value
+                draw.polygon(coords, fill=damage_class)
             
             # Apply augmentation if enabled
             if self.augment:
@@ -237,8 +335,7 @@ class XBDBuildingSegDataset(Dataset):
             
             # Resize the mask and convert to tensor
             mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
-            mask_tensor = torch.from_numpy(np.array(mask)).float() / 255.0
-            mask_tensor = mask_tensor.unsqueeze(0)  # Add channel dimension
+            mask_tensor = torch.from_numpy(np.array(mask)).long()  # Use long tensor for class indices
             
             return img_tensor, mask_tensor
             
@@ -246,7 +343,7 @@ class XBDBuildingSegDataset(Dataset):
             print(f"Error processing item {idx}: {e}")
             # Return placeholder tensors in case of error
             img_tensor = torch.zeros(3, self.image_size, self.image_size)
-            mask_tensor = torch.zeros(1, self.image_size, self.image_size)
+            mask_tensor = torch.zeros(self.image_size, self.image_size, dtype=torch.long)
             return img_tensor, mask_tensor
 
 
@@ -271,9 +368,8 @@ class DoubleConv(nn.Module):
 class UNet(nn.Module):
     """
     U-Net architecture for semantic segmentation of buildings.
-    Based on the original U-Net paper with some modern improvements.
     """
-    def __init__(self, in_channels=3, out_channels=1):
+    def __init__(self, in_channels=3, out_channels=5):
         super(UNet, self).__init__()
         
         # Encoder (downsampling)
@@ -344,29 +440,9 @@ class UNet(nn.Module):
             up1 = F.interpolate(up1, size=e1.shape[2:], mode='bilinear', align_corners=False)
         d1 = self.dec1(torch.cat([up1, e1], dim=1))
         
-        # Final layer with sigmoid activation for binary segmentation
-        return torch.sigmoid(self.final(d1))
-
-
-# Dice loss for segmentation
-class DiceLoss(nn.Module):
-    """
-    Dice loss for image segmentation.
-    Computes the Sørensen-Dice loss between predicted and target masks.
-    """
-    def __init__(self, smooth=1.0):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
-    
-    def forward(self, pred, target):
-        pred_flat = pred.view(-1)
-        target_flat = target.view(-1)
-        
-        intersection = (pred_flat * target_flat).sum()
-        dice_score = (2. * intersection + self.smooth) / (
-            pred_flat.sum() + target_flat.sum() + self.smooth)
-        
-        return 1 - dice_score
+        # Final layer - return logits directly (no softmax activation)
+        # This change makes it compatible with both CrossEntropyLoss and our FocalLoss
+        return self.final(d1)
 
 
 # Functions for training and evaluation
@@ -395,21 +471,99 @@ def create_versioned_directory(base_path, prefix="localization_run"):
         i += 1
 
 
-def calculate_iou(pred, target, threshold=0.5):
+def calculate_iou(pred, target, threshold=0.5, num_classes=5):
     """
-    Calculate Intersection over Union (IoU) score between predicted and target masks.
-    Predictions are thresholded to create binary masks.
+    Calculate mean Intersection over Union (IoU) score across all classes.
+    For multi-class segmentation, computes IoU for each class and returns the mean.
+    
+    Args:
+        pred: Predicted segmentation map (logits or class indices)
+        target: Ground truth segmentation map
+        threshold: Threshold for binary segmentation
+        num_classes: Number of classes for multi-class segmentation
+    
+    Returns:
+        Mean IoU across all classes
     """
-    # Apply threshold to obtain binary masks
-    pred_binary = (pred > threshold).float()
+    # For binary segmentation (building vs non-building)
+    # This part is kept for backward compatibility
+    if pred.shape[1] == 1 and target.shape[1] == 1:
+        # Apply threshold to obtain binary masks
+        pred_binary = (pred > threshold).float()
+        
+        # Flatten the tensors for simple calculation
+        pred_flat = pred_binary.view(-1).cpu().numpy()
+        target_flat = target.view(-1).cpu().numpy()
+        
+        # Calculate IoU using scikit-learn's implementation
+        iou = jaccard_score(target_flat, pred_flat, average='binary')
+        return iou
     
-    # Flatten the tensors for simple calculation
-    pred_flat = pred_binary.view(-1).cpu().numpy()
-    target_flat = target.view(-1).cpu().numpy()
+    # For multi-class segmentation
+    # If pred is logits, convert to class indices
+    if pred.shape[1] > 1 and pred.dim() == 4:  # [batch_size, num_classes, height, width]
+        # Get the predicted class using argmax
+        _, pred_classes = torch.max(pred, dim=1)  # Shape: [batch_size, height, width]
+    else:
+        pred_classes = pred  # Assume pred already contains class indices
     
-    # Calculate IoU using scikit-learn's implementation
-    iou = jaccard_score(target_flat, pred_flat, average='binary')
-    return iou
+    # Similarly for target
+    if target.shape[1] > 1 and target.dim() == 4:
+        _, target_classes = torch.max(target, dim=1)
+    else:
+        target_classes = target
+    
+    # Ensure both are of the right shape
+    if pred_classes.dim() == 3:  # [batch_size, height, width]
+        pass  # Already in correct format
+    elif pred_classes.dim() == 2:  # [height, width]
+        pred_classes = pred_classes.unsqueeze(0)  # Add batch dimension
+    
+    if target_classes.dim() == 3:
+        pass  # Already in correct format
+    elif target_classes.dim() == 2:
+        target_classes = target_classes.unsqueeze(0)
+    
+    # Calculate IoU for each class
+    batch_size = pred_classes.size(0)
+    total_iou = 0.0
+    
+    # Process each sample in the batch separately
+    for b in range(batch_size):
+        sample_iou = 0.0
+        num_valid_classes = 0
+        
+        # Calculate IoU for each class
+        for cls in range(num_classes):
+            # Extract binary masks for the current class
+            pred_mask = (pred_classes[b] == cls).cpu().numpy().flatten()
+            target_mask = (target_classes[b] == cls).cpu().numpy().flatten()
+            
+            # Skip if this class is not present in the ground truth
+            if np.sum(target_mask) == 0:
+                continue
+            
+            # Calculate intersection and union
+            intersection = np.logical_and(pred_mask, target_mask).sum()
+            union = np.logical_or(pred_mask, target_mask).sum()
+            
+            # Calculate IoU for this class
+            if union == 0:
+                iou = 0.0
+            else:
+                iou = intersection / union
+            
+            sample_iou += iou
+            num_valid_classes += 1
+        
+        # Calculate mean IoU for this sample
+        if num_valid_classes > 0:
+            sample_iou /= num_valid_classes
+        
+        total_iou += sample_iou
+    
+    # Return mean IoU across all samples in the batch
+    return total_iou / batch_size
 
 
 def plot_learning_curves(epochs, train_losses, val_losses, val_ious, save_path):
@@ -443,14 +597,34 @@ def plot_learning_curves(epochs, train_losses, val_losses, val_ious, save_path):
 
 def visualize_predictions(model, dataset, device, num_samples=4, save_path=None):
     """
-    Visualize model predictions on a few sample images.
+    Visualize model predictions and calculate per-class IoU metrics.
     Saves the original image, ground truth mask, and predicted mask side by side.
+    Also calculates and displays IoU for each damage class to evaluate classification accuracy.
     """
     model.eval()
     # Select random indices
     indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
     
-    plt.figure(figsize=(15, 4 * num_samples))
+    # Define colors for each damage class
+    # Format: [R, G, B]
+    damage_colors = [
+        [0, 0, 0],       # Background (black)
+        [0, 255, 0],     # No damage (green)
+        [255, 255, 0],   # Minor damage (yellow)
+        [255, 165, 0],   # Major damage (orange)
+        [255, 0, 0]      # Destroyed (red)
+    ]
+    
+    # Class names for display
+    class_names = ['Background', 'No Damage', 'Minor Damage', 'Major Damage', 'Destroyed']
+    
+    # Configure the plot
+    fig = plt.figure(figsize=(15, 6 * num_samples))
+    
+    # Track per-class IoU stats
+    class_pixels_total = {cls: 0 for cls in range(5)}
+    class_pixels_correct = {cls: 0 for cls in range(5)}
+    class_pixels_pred = {cls: 0 for cls in range(5)}
     
     with torch.no_grad():
         for i, idx in enumerate(indices):
@@ -460,45 +634,103 @@ def visualize_predictions(model, dataset, device, num_samples=4, save_path=None)
             
             # Get prediction
             pred = model(image)
-            pred = pred.squeeze().cpu().numpy()
             
-            # Convert to binary mask
-            pred_binary = (pred > 0.5).astype(np.float32)
+            # Convert logits to class predictions
+            pred = F.softmax(pred, dim=1).squeeze().cpu().numpy()  # Shape: [num_classes, H, W]
             
-            # Convert tensors to numpy for visualization
-            image = image.squeeze().cpu().numpy()
+            # Convert to class indices using argmax along the class dimension
+            pred_class = np.argmax(pred, axis=0)  # Shape: [H, W]
+            
+            # Get ground truth mask
             mask = mask.squeeze().cpu().numpy()
             
-            # Denormalize image
+            # Create colored visualizations
+            colored_pred = np.zeros((pred_class.shape[0], pred_class.shape[1], 3), dtype=np.uint8)
+            colored_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            
+            # Color each class in the prediction and ground truth
+            for class_idx in range(len(damage_colors)):
+                colored_pred[pred_class == class_idx] = damage_colors[class_idx]
+                colored_mask[mask == class_idx] = damage_colors[class_idx]
+            
+            # Calculate per-class metrics for this sample
+            for cls in range(5):
+                # Ground truth pixels for this class
+                gt_pixels = (mask == cls)
+                # Predicted pixels for this class
+                pred_pixels = (pred_class == cls)
+                
+                # True positives (correctly classified)
+                true_pos = np.logical_and(gt_pixels, pred_pixels).sum()
+                
+                # Update totals
+                class_pixels_total[cls] += gt_pixels.sum()
+                class_pixels_correct[cls] += true_pos
+                class_pixels_pred[cls] += pred_pixels.sum()
+            
+            # Denormalize image for display
+            image = image.squeeze().cpu().numpy()
             mean = np.array([0.485, 0.456, 0.406])
             std = np.array([0.229, 0.224, 0.225])
             image = np.transpose(image, (1, 2, 0))
             image = image * std + mean
             image = np.clip(image, 0, 1)
             
-            # Plot
+            # Plot images on the top row
             plt.subplot(num_samples, 3, i*3 + 1)
             plt.imshow(image)
             plt.title("Pre-disaster Image")
             plt.axis('off')
             
             plt.subplot(num_samples, 3, i*3 + 2)
-            plt.imshow(mask, cmap='gray')
+            plt.imshow(colored_mask)
             plt.title("Ground Truth Mask")
             plt.axis('off')
             
             plt.subplot(num_samples, 3, i*3 + 3)
-            plt.imshow(pred_binary, cmap='gray')
-            plt.title("Predicted Mask")
+            plt.imshow(colored_pred)
+            plt.title("Predicted Damage Classes")
             plt.axis('off')
     
-    plt.tight_layout()
+    # Calculate IoU for each class
+    class_iou = {}
+    for cls in range(5):
+        if class_pixels_total[cls] == 0:
+            class_iou[cls] = float('nan')  # No ground truth pixels for this class
+        else:
+            union = class_pixels_total[cls] + class_pixels_pred[cls] - class_pixels_correct[cls]
+            if union > 0:
+                class_iou[cls] = class_pixels_correct[cls] / union
+            else:
+                class_iou[cls] = float('nan')
+    
+    # Add a text box with per-class IoU results
+    plt.figtext(0.5, 0.01, f"Per-Class IoU Metrics:", ha="center", fontsize=14, bbox={"facecolor":"white", "alpha":0.5, "pad":5})
+    
+    text = ""
+    for cls in range(5):
+        iou_value = class_iou[cls]
+        iou_str = f"{iou_value:.4f}" if not np.isnan(iou_value) else "N/A"
+        text += f"{class_names[cls]}: {iou_str}   "
+    
+    plt.figtext(0.5, 0.005, text, ha="center", fontsize=12)
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Leave room for the text at the bottom
     
     if save_path:
         plt.savefig(save_path)
         print(f"Prediction visualization saved to {save_path}")
     
+    # Print per-class IoU to console as well
+    print("\nPer-Class IoU Metrics:")
+    for cls in range(5):
+        iou_value = class_iou[cls]
+        iou_str = f"{iou_value:.4f}" if not np.isnan(iou_value) else "N/A"
+        print(f"  {class_names[cls]}: {iou_str}")
+    
     plt.close()
+    
+    return class_iou
 
 
 def main():
@@ -519,9 +751,10 @@ def main():
     root_dir = os.path.join(project_root, "data", "xBD")
     batch_size = 16
     lr = 0.0002
-    num_epochs = 25
+    num_epochs = 12  # Changed to 12 epochs as requested
     val_ratio = 0.2
     image_size = 256
+    num_classes = 5  # Class 0: background, 1: no-damage, 2: minor-damage, 3: major-damage, 4: destroyed
     
     # Create output directory
     output_dir = os.path.join(project_root, "output", "localization")
@@ -541,7 +774,8 @@ def main():
         "learning_rate": lr,
         "num_epochs": num_epochs,
         "val_ratio": val_ratio,
-        "image_size": image_size
+        "image_size": image_size,
+        "num_classes": num_classes
     }
     
     with open(os.path.join(run_dir, f"config_run{run_num}.txt"), "w") as f:
@@ -574,11 +808,62 @@ def main():
     
     print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
     
+    # Calculate class frequencies from training dataset
+    print("Calculating class frequencies for weighting...")
+    class_counts = torch.zeros(num_classes)
+    
+    # Keep track of damage class presence in each sample for weighted sampling
+    sample_weights = torch.ones(len(train_indices))
+    
+    for i, idx in enumerate(tqdm(train_indices, desc="Counting class pixels")):
+        _, mask = full_dataset[idx]
+        
+        # Count pixels of each class
+        for c in range(num_classes):
+            class_count = (mask == c).sum().item()
+            class_counts[c] += class_count
+            
+            # Give higher weights to samples containing damaged buildings
+            if c >= 2 and class_count > 0:  # If sample has minor, major, or destroyed damage
+                # Scale the weight based on the damage level and amount
+                damage_weight = (c / num_classes) * 10  # Higher damage classes get higher weights
+                sample_weights[i] = max(sample_weights[i], damage_weight)
+    
+    # Calculate class weights inversely proportional to frequencies
+    total_pixels = class_counts.sum()
+    # Normalized class frequencies
+    class_frequencies = class_counts / total_pixels
+    print(f"Class distribution: {class_frequencies.tolist()}")
+    
+    # Calculate inverse frequency weights and normalize
+    # Adding epsilon (1e-6) to prevent division by zero
+    inverse_freq_weights = 1.0 / (class_frequencies + 1e-6)
+    # Normalize weights to make their mean equal to 1
+    inverse_freq_weights = inverse_freq_weights / inverse_freq_weights.mean()
+    
+    # Cap weights to prevent extremely high values
+    inverse_freq_weights = torch.clamp(inverse_freq_weights, min=0.1, max=10.0)
+    
+    # Move to device
+    class_weights = inverse_freq_weights.to(device)
+    
+    print(f"Calculated class weights: {class_weights.tolist()}")
+    
+    # Create a weighted sampler for training data to balance class representation
+    # This will oversample images containing rare damage classes
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_indices),
+        replacement=True
+    )
+    
+    print("Using weighted sampler to balance training batches")
+    
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,  # Use our weighted sampler instead of shuffle
         num_workers=4,
         pin_memory=True
     )
@@ -592,10 +877,15 @@ def main():
     )
     
     # Initialize model
-    model = UNet(in_channels=3, out_channels=1).to(device)
+    model = UNet(in_channels=3, out_channels=num_classes).to(device)
     
-    # Loss function
-    criterion = DiceLoss()
+    # Use Focal Loss instead of Cross Entropy Loss for better handling of class imbalance
+    # The gamma parameter controls the down-weighting of well-classified examples
+    gamma = 2.0  # Recommended value from the paper
+    criterion = FocalLoss(gamma=gamma, alpha=class_weights)
+    
+    # Log the loss function configuration
+    print(f"Using Focal Loss with gamma={gamma} and class weights={class_weights.tolist()}")
     
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -627,16 +917,17 @@ def main():
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
         for images, masks in train_pbar:
             images = images.to(device)
+            # Masks are now class indices (0-4), no need to convert
             masks = masks.to(device)
             
             # Zero gradients
             optimizer.zero_grad()
             
-            # Forward pass
-            preds = model(images)
+            # Forward pass - outputs shape: [batch_size, num_classes, H, W]
+            outputs = model(images)  # Now outputs logits directly
             
-            # Compute loss
-            loss = criterion(preds, masks)
+            # Compute loss using Focal Loss
+            loss = criterion(outputs, masks)
             
             # Backward pass and optimization
             loss.backward()
@@ -661,14 +952,17 @@ def main():
                 masks = masks.to(device)
                 
                 # Forward pass
-                preds = model(images)
+                outputs = model(images)  # Now outputs logits directly
                 
                 # Compute loss
-                loss = criterion(preds, masks)
+                loss = criterion(outputs, masks)
                 val_loss += loss.item()
                 
-                # Calculate IoU
-                batch_iou = calculate_iou(preds, masks)
+                # Get predicted class for each pixel
+                _, preds = torch.max(outputs, dim=1)
+                
+                # Calculate IoU for multi-class segmentation
+                batch_iou = calculate_iou(preds, masks, num_classes=num_classes)
                 val_iou += batch_iou
                 
                 val_pbar.set_postfix({"loss": f"{loss.item():.4f}", "iou": f"{batch_iou:.4f}"})

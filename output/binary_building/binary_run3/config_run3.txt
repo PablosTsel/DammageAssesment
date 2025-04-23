@@ -1,0 +1,6 @@
+timestamp: 20250422_140748
+batch_size: 16
+learning_rate: 0.0002
+num_epochs: 25
+val_ratio: 0.2
+image_size: 256
