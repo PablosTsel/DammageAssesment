@@ -28,10 +28,10 @@ project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 sys.path.insert(0, project_root)
 
 # Import from our other scripts
-from scripts.training.localization_model import UNet
+from scripts.training.utils import UNet, create_versioned_directory
 
 # Import the improved damage classifier
-from scripts.training.train_improved_damage_classifier import (
+from scripts.training.train_damage_classifier import (
     ImprovedDamageClassifier, AttentionFusion, ImprovedDamageDataset, DAMAGE_CLASS_MAP
 )
 
@@ -740,10 +740,10 @@ def main():
     project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
     
     # Model paths
-    building_detector_path = os.path.join(project_root, "output", "binary_building", "binary_building_best.pt")
+    building_detector_path = os.path.join(project_root, "output", "building_detector", "binary_building_best.pt")
     
     # Check if improved damage classifier exists first
-    improved_damage_path = os.path.join(project_root, "output", "improved_damage", "improved_damage_best.pt")
+    improved_damage_path = os.path.join(project_root, "output", "dam_classifier", "improved_damage_best.pt")
 
     # Only use the improved damage classifier
     if os.path.exists(improved_damage_path):
@@ -751,7 +751,7 @@ def main():
         print(f"Using improved damage classifier: {improved_damage_path}")
     else:
         print(f"ERROR: Improved damage classifier model not found at: {improved_damage_path}")
-        print("Please train the improved damage classifier using scripts/training/train_improved_damage_classifier.py")
+        print("Please train the damage classifier using scripts/training/train_damage_classifier.py")
         return
 
     # Verify that the model files exist
@@ -762,8 +762,12 @@ def main():
     
     # Create output directory for evaluation results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(project_root, "output", "evaluation_two_stage", f"eval_{timestamp}")
+    output_dir = os.path.join(project_root, "output", "evaluation_two_stage")
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Create versioned run directory
+    run_dir, run_num = create_versioned_directory(output_dir, prefix="eval_run")
+    os.makedirs(run_dir, exist_ok=True)
     
     # Settings
     image_size = 256
@@ -813,10 +817,10 @@ def main():
         integrated_model=integrated_model,
         dataset=test_dataset,
         num_samples=num_test_samples,
-        output_dir=output_dir
+        output_dir=run_dir
     )
     
-    print(f"Evaluation complete. Results saved to: {output_dir}")
+    print(f"Evaluation complete. Results saved to: {run_dir}")
     
     # Save the model configuration
     config = {
@@ -830,7 +834,7 @@ def main():
         "mean_damage_iou": metrics["mean_damage_iou"]
     }
     
-    config_path = os.path.join(output_dir, "config.txt")
+    config_path = os.path.join(run_dir, "config.txt")
     with open(config_path, "w") as f:
         for key, value in config.items():
             f.write(f"{key}: {value}\n")

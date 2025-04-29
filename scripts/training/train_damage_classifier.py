@@ -28,8 +28,8 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 sys.path.insert(0, project_root)
 
-# Import from localization_model 
-from scripts.training.individual.localization_model import (
+# Import from utils module
+from scripts.training.utils import (
     UNet, seed_everything, create_versioned_directory, 
     calculate_iou, plot_learning_curves, FocalLoss
 )
@@ -801,9 +801,9 @@ def main():
     
     # Copy the best model to the main directory
     if best_model_path and os.path.exists(best_model_path):
-        improved_best_path = os.path.join(output_dir, "improved_damage_best.pt")
-        shutil.copy2(best_model_path, improved_best_path)
-        print(f"Best model copied to {improved_best_path}")
+        damage_best_path = os.path.join(output_dir, "improved_damage_best.pt")
+        shutil.copy2(best_model_path, damage_best_path)
+        print(f"Best model copied to {damage_best_path}")
     
     # Create learning curves plot
     curves_save_path = os.path.join(viz_dir, "learning_curves.png")

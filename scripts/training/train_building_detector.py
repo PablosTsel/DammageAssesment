@@ -29,7 +29,7 @@ project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 sys.path.insert(0, project_root)
 
 # Import the UNet architecture and helper functions
-from scripts.training.localization_model import (
+from scripts.training.utils import (
     UNet, seed_everything, create_versioned_directory, 
     calculate_iou, plot_learning_curves
 )
@@ -358,11 +358,11 @@ def main():
     image_size = 256
     
     # Create output directory for binary segmentation model
-    output_dir = os.path.join(project_root, "output", "binary_building")
+    output_dir = os.path.join(project_root, "output", "building_detector")
     os.makedirs(output_dir, exist_ok=True)
     
     # Create versioned run directory
-    run_dir, run_num = create_versioned_directory(output_dir, prefix="binary_run")
+    run_dir, run_num = create_versioned_directory(output_dir, prefix="detect_run")
     model_dir = os.path.join(run_dir, "models")
     viz_dir = os.path.join(run_dir, "visualizations")
     os.makedirs(model_dir, exist_ok=True)
