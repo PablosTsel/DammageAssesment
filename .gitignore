@@ -14,3 +14,6 @@ data/
 # You can also ignore other common files:
 __pycache__/
 *.pyc
+output/building_detector/detect_run6/models/best_model_epoch_20.pt
+output/dam_classifier/classifier_run4/models/best_model_epoch_14.pt
+output/dam_classifier/classifier_run6/models/best_model_epoch_18.pt
