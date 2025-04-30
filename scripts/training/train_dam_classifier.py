@@ -548,7 +548,7 @@ def main():
     root_dir = os.path.join(project_root, "data", "xBD")
     batch_size = 4
     lr = 0.0002
-    num_epochs = 15
+    num_epochs = 20
     val_ratio = 0.2
     image_size = 256
     num_classes = 5  # Background + 4 damage classes

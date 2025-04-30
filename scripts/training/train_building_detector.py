@@ -353,7 +353,7 @@ def main():
     root_dir = os.path.join(project_root, "data", "xBD")
     batch_size = 16
     lr = 0.0002
-    num_epochs = 25
+    num_epochs = 20
     val_ratio = 0.2
     image_size = 256
     

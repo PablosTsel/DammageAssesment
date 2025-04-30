@@ -31,7 +31,7 @@ sys.path.insert(0, project_root)
 from scripts.training.utils import UNet, create_versioned_directory
 
 # Import the improved damage classifier
-from scripts.training.train_damage_classifier import (
+from scripts.training.train_dam_classifier import (
     ImprovedDamageClassifier, AttentionFusion, ImprovedDamageDataset, DAMAGE_CLASS_MAP
 )
 
